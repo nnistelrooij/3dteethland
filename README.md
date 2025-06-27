@@ -1,6 +1,8 @@
-# 3DTeethLand
+# ToothInstanceNet
 
-Welcome to the repository of our solution to the 3DTeethLand challenge.
+Welcome to the repository of our solution to the [3DTeethLand challenge](https://www.synapse.org/Synapse:syn57400900/wiki/).
+
+![alt text](docs/method.png "ToothInstanceNet")
 
 
 ## Install
@@ -21,7 +23,7 @@ pip install -r requirements.txt
 Lastly, compile and install the Cuda kernels.
 
 ``` bash
-pip install -e -v .
+pip install -v -e .
 ```
 
 

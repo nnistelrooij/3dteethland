@@ -18,12 +18,13 @@ class TeethSegDataset(MeshDataset):
 
     def __init__(
         self,
+        norm: bool,
         clean: bool,
         pre_transform: Callable[..., Dict[str, Any]]=dict,
         **kwargs: Dict[str, Any],
     ) -> None:
         pre_transform = T.Compose(
-            T.ZScoreNormalize(self.MEAN, self.STD),
+            T.ZScoreNormalize(self.MEAN, self.STD) if norm else dict,
             T.PoseNormalize() if clean else dict,
             T.InstanceCentroids(),
             pre_transform,
@@ -52,20 +53,18 @@ class TeethSegDataset(MeshDataset):
     ) -> Dict[str, Union[bool, int, NDArray[Any]]]:
         ms = pymeshlab.MeshSet()
         ms.load_new_mesh(str(self.root / file))
-        ms.meshing_remove_duplicate_vertices()
-        # if self.clean:
-        #     ms.meshing_repair_non_manifold_edges()
-        #     ms.meshing_close_holes(maxholesize=130)  # ~20mm boundary
 
         mesh = ms.current_mesh()
         mesh.compact()
 
         return {
             'scan_file': file.as_posix(),
+            'affine': np.eye(4),
             'is_lower': self.load_jaw(file) in ['lower', 'mandible'],
             'points': mesh.vertex_matrix(),
             'triangles': mesh.face_matrix(),
             'normals': mesh.vertex_normal_matrix(),
+            'colors': mesh.vertex_color_matrix()[:, :3],
             'point_count': mesh.vertex_number(),
             'triangle_count': mesh.face_number(),
         }
@@ -77,12 +76,22 @@ class TeethSegDataset(MeshDataset):
         with open(self.root / file, 'rb') as f:
             annotation = json.load(f)
 
-        instances = np.array(annotation['instances'])
-        _, instances, counts = np.unique(instances, return_inverse=True, return_counts=True)
-
         labels = np.array(annotation['labels'])
-        instances[(counts < 20)[instances]] = 0
-        labels[(counts < 20)[instances]] = 0
+        types = np.array(annotation.get('types', [0]*labels.shape[0]))
+        attributes = annotation.get('attributes', [[]]*labels.shape[0])
+        attributes = np.array([max(attrs) if attrs else 0 for attrs in attributes])
+        instances = np.array(annotation['instances'])
+        
+        _, instances, counts = np.unique(instances, return_inverse=True, return_counts=True)
+        labels[(counts < 30)[instances]] = 0
+        types[(counts < 30)[instances]] = 0
+        attributes[(counts < 30)[instances]] = 0
+        instances[(counts < 30)[instances]] = 0
+        _, instances = np.unique(instances, return_inverse=True)
+
+        if labels.sum() != sum(annotation['labels']):
+            removed_labels = set(annotation['labels']) - set(labels.tolist())
+            print(file, 'counts', np.sort(counts), 'removed', removed_labels)
 
         return {
             **(
@@ -91,6 +100,8 @@ class TeethSegDataset(MeshDataset):
                 {'confidences': np.array(annotation['confidences'])}
             ),
             'labels': labels,
+            'types': types,
+            'attributes': attributes,
             'instances': instances,
         }
 
@@ -111,21 +122,11 @@ class TeethLandDataset(TeethSegDataset):
         self,
         seg_root: Path,
         landmarks_root: Path,
-        include_cusps: bool,
-        to_left_right: bool,
-        separate_front_posterior: bool,
         **kwargs: Dict[str, Any],
     ) -> None:
         super().__init__(
             root=seg_root,
-            pre_transform=T.Compose(
-                T.MatchLandmarksAndTeeth(),
-                T.StructureLandmarks(
-                    include_cusps=include_cusps,
-                    to_left_right=to_left_right,
-                    separate_front_posterior=separate_front_posterior,
-                ),
-            ),
+            pre_transform=T.MatchLandmarksAndTeeth(),
             **kwargs,
         )
         

@@ -1,0 +1,10 @@
+A5_lower.ply
+A5_upper.ply
+A23- 05-2012, B3ZNM 400098_lower.ply
+A23- 05-2012, B3ZNM 400098_upper.ply
+A16_lower.ply
+A16_upper.ply
+A27-  08-2015, CCUSB 213298_lower.ply
+A27-  08-2015, CCUSB 213298_upper.ply
+A36- 07-2015 CCUSB 013524_lower.ply
+A36- 07-2015 CCUSB 013524_upper.ply

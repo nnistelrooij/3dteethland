@@ -134,6 +134,7 @@ class IdentificationLoss(nn.Module):
         self.w_ce = w_ce
         self.w_focal = w_focal
         self.w_homo = w_homo
+
         self.alpha = alpha
         self.gamma = gamma
 
@@ -143,6 +144,9 @@ class IdentificationLoss(nn.Module):
         classes: PointTensor,
         targets: PointTensor,
     ):
+        if classes.F.shape[0] == 0:
+            return 0
+        
         ce_loss = F.cross_entropy(classes.F, targets.F, reduction='none', label_smoothing=0.01)
 
         pt = torch.exp(-ce_loss)
@@ -160,57 +164,9 @@ class IdentificationLoss(nn.Module):
         )
 
         return loss
-    
-
-class PoolingLandmarkLoss(nn.Module):
-
-    def __init__(
-        self,
-        w_offsets: float=12.0,
-        w_kobjs: float=1.0,
-        w_homo: float=1.0,
-    ):
-        super().__init__()
-
-        self.w_offsets = w_offsets
-        self.w_kobjs = w_kobjs
-        self.w_homo = w_homo
-
-        self.bce = nn.BCEWithLogitsLoss(reduction='none')
-
-    def forward(
-        self,
-        prototypes: PointTensor,
-        landmarks: PointTensor,
-        targets: PointTensor,
-    ):
-        landmarks = landmarks.F.reshape(landmarks.F.shape[0], -1, 4)
-        coords = landmarks[..., :3]
-        kobjs = landmarks[..., -1]
-
-        kpt_mask = torch.any(~torch.isclose(targets.F, torch.zeros_like(targets.F)), axis=-1)
-
-        d = torch.pow(coords - targets.F, 2).sum(-1)
-        kpt_loss_factor = kpt_mask.shape[1] / (torch.sum(kpt_mask != 0, dim=1) + 1e-9)
-        offsets_loss = kpt_loss_factor[:, None] * ((1 - torch.exp(-d)) * kpt_mask)
-
-        kobj_loss = self.bce(kobjs, kpt_mask.float())
-        
-        homo_loss = torch.zeros(0).to(coords)
-        for b in range(prototypes.batch_size):
-            homo = torch.mean(prototypes.batch(b).F - prototypes.batch(b).F.mean(0))
-            homo_loss = torch.cat((homo_loss, homo[None]))
-
-        loss = (
-            self.w_offsets * offsets_loss.mean()
-            + self.w_kobjs * kobj_loss.mean()
-            + self.w_homo * homo_loss.mean()
-        )
-
-        return loss
 
 
-class OffsetLandmarkLoss(nn.Module):
+class LandmarkLoss(nn.Module):
 
     def __init__(
         self,
@@ -294,34 +250,3 @@ class OffsetLandmarkLoss(nn.Module):
             loss = loss / landmarks.batch_size
 
         return loss
-
-
-class LandmarkLoss(nn.Module):
-
-    def __init__(
-        self,
-        w_offsets: float=12.0,
-        w_kobjs: float=1.0,
-        w_homo: float=1.0,
-        dist_thresh: float=0.12,
-        w_dist: float=0.05,
-        w_chamfer: float=0.05,
-        w_separation: float=0.0005,
-    ):
-        super().__init__()
-
-        self.pooling_loss = PoolingLandmarkLoss(w_offsets, w_kobjs, w_homo)
-        self.points_loss = OffsetLandmarkLoss(dist_thresh, w_dist, w_chamfer, w_separation)
-    
-    def forward(
-        self,
-        prototypes: PointTensor,
-        centroid_offsets: PointTensor,
-        point_offsets: PointTensor,
-        instances: PointTensor,
-        landmarks: PointTensor,
-    ):
-        instances_loss = self.pooling_loss(prototypes, centroid_offsets, instances)
-        points_loss = self.points_loss(point_offsets, landmarks, [5, 6])
-
-        return instances_loss, points_loss

@@ -41,8 +41,8 @@ class LandmarkMeanAveragePrecision(Metric):
         landmarks: PointTensor,
     ) -> None:
         self.pred_coords.append(pred_landmarks.C)
-        self.pred_classes.append(pred_landmarks.F)
-        self.pred_batch_counts.append(torch.tensor(pred_landmarks.C.shape[0]).to(pred_landmarks.F))
+        self.pred_classes.append(pred_landmarks.F[:, 1].long())
+        self.pred_batch_counts.append(torch.tensor(pred_landmarks.C.shape[0]).to(landmarks.F))
 
         self.gt_coords.append(landmarks.C)
         self.gt_classes.append(landmarks.F)

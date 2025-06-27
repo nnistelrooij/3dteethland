@@ -29,6 +29,12 @@ class DatasetCache(dict):
         self.cache_path = cache_path
         self.disable = disable
 
+    def __getitem__(self, key: int) -> Any:
+        value = super().__getitem__(key)
+        value = copy.deepcopy(value)
+
+        return value
+
     def __setitem__(self, key: int, value: Any) -> None:
         if self.disable:
             return

@@ -1,15 +1,15 @@
 import copy
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import networkx
 from numpy.typing import ArrayLike, NDArray
-import open3d
-from scipy.optimize import linear_sum_assignment
+from scipy.spatial.transform import Rotation
 from scipy.special import softmax
-from scipy.stats import truncnorm
+from scipy.stats import multivariate_normal, truncnorm
 from sklearn.decomposition import PCA
 import torch
-from torch_scatter import scatter_mean, scatter_min
+from torch_scatter import scatter_mean, scatter_min, scatter_max
 from torchtyping import TensorType
 
 
@@ -110,8 +110,6 @@ class RandomZAxisRotate:
 
         if 'landmark_coords' in data_dict:
             data_dict['landmark_coords'] = data_dict['landmark_coords'] @ R.T
-        if 'instance_landmarks' in data_dict:
-            data_dict['instance_landmarks'] = data_dict['instance_landmarks'] @ R.T
         if 'instance_centroids' in data_dict:
             data_dict['instance_centroids'] = data_dict['instance_centroids'] @ R.T
         
@@ -146,11 +144,9 @@ class RandomScale(object):
         data_dict['points'] = points * scale
 
         if 'landmark_coords' in data_dict:
-            data_dict['landmark_coords'] *= scale
-        if 'instance_landmarks' in data_dict:
-            data_dict['instance_landmarks'] *= scale
+            data_dict['landmark_coords'] = data_dict['landmark_coords'] * scale
         if 'instance_centroids' in data_dict:
-            data_dict['instance_centroids'] *= scale
+            data_dict['instance_centroids'] = data_dict['instance_centroids'] * scale
         
         return data_dict
 
@@ -199,55 +195,55 @@ class RandomJitter(object):
         ])
 
 
-class RandomAxisFlip(object):
+class RandomXAxisFlip(object):
 
     def __init__(
         self,
-        axis: int=0,
         prob: float=0.5,
-        landmark_flip_idxs: Optional[List[int]]=None,
         rng: Optional[np.random.Generator]=None,
     ) -> None:
-        self.axis = axis
         self.prob = prob
-        self.landmark_flip_idxs = landmark_flip_idxs
         self.rng = np.random.default_rng() if rng is None else rng
+
+        self.label_map = np.arange(86)
+        self.label_map[11:19] = np.arange(21, 29)
+        self.label_map[21:29] = np.arange(11, 19)
+        self.label_map[31:39] = np.arange(41, 49)
+        self.label_map[41:49] = np.arange(31, 39)
+        self.label_map[51:56] = np.arange(61, 66)
+        self.label_map[61:66] = np.arange(51, 56)
+        self.label_map[71:76] = np.arange(81, 86)
+        self.label_map[81:86] = np.arange(71, 76)
 
     def __call__(
         self,
         points: NDArray[Any],
         **data_dict: Dict[str, Any],
     ) -> Dict[str, Any]:
-        if self.rng.random() < self.prob:
-            coords = points[:, self.axis]
-            points[:, self.axis] = coords.max() + coords.min() - coords
+        if self.rng.random() >= self.prob:
+            data_dict['flip'] = False
+            data_dict['points'] = points
 
-            if 'normals' in data_dict:
-                data_dict['normals'][:, self.axis] *= -1
+            return data_dict
 
-            if 'landmark_coords' in data_dict:
-                landmarks = data_dict['landmark_coords'][:, self.axis]
-                data_dict['landmark_coords'][:, self.axis] = (
-                    coords.max() + coords.min() - landmarks
-                )
-                data_dict['landmark_classes'] = self.landmark_flip_idxs[data_dict['landmark_classes']]
-                
-            if 'instance_landmarks' in data_dict:
-                landmarks_mask = np.any(data_dict['instance_landmarks'] != 0, axis=-1)
-                landmarks = data_dict['instance_landmarks'][..., self.axis]
-                data_dict['instance_landmarks'][..., self.axis] = np.where(
-                    landmarks_mask, coords.max() + coords.min() - landmarks, 0.0,
-                )
-                flip_idxs = self.landmark_flip_idxs[:data_dict['instance_landmarks'].shape[1]]
-                data_dict['instance_landmarks'] = data_dict['instance_landmarks'][:, flip_idxs]
-
-            if 'instance_centroids' in data_dict:
-                centroids = data_dict['instance_centroids'][:, self.axis]
-                data_dict['instance_centroids'][:, self.axis] = (
-                    coords.max() + coords.min() - centroids
-                )
-
+        data_dict['flip'] = True
+        points[:, 0] = -points[:, 0]
         data_dict['points'] = points
+
+        if 'normals' in data_dict:
+            data_dict['normals'][:, 0] = -data_dict['normals'][:, 0]
+
+        if 'landmark_coords' in data_dict:
+            landmarks = data_dict['landmark_coords'][:, 0]
+            data_dict['landmark_coords'][:, 0] = -landmarks
+
+        if 'instance_centroids' in data_dict:
+            centroids = data_dict['instance_centroids'][:, 0]
+            data_dict['instance_centroids'][:, 0] = -centroids
+
+        if 'labels' in data_dict:
+            data_dict['instance_labels'] = self.label_map[data_dict['instance_labels']]
+            data_dict['labels'] = self.label_map[data_dict['labels']]
 
         return data_dict
 
@@ -255,6 +251,50 @@ class RandomAxisFlip(object):
         return '\n'.join([
             self.__class__.__name__ + '(',
             f'    prob: {self.prob},',
+            ')',
+        ])
+    
+
+class RandomShiftCentroids:
+
+    def __init__(
+        self,
+        pos_sample: float=0.30,  # 0.6666 ** 3
+        rng: Optional[np.random.Generator]=None,
+    ) -> None:
+        self.pos_sample = pos_sample
+        self.rng = np.random.default_rng() if rng is None else rng
+
+    def __call__(
+        self,
+        points: NDArray[Any],
+        instances: NDArray[Any],
+        instance_centroids: NDArray[Any],
+        **data_dict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        out = []
+        for i, mean in enumerate(instance_centroids):
+            if (instances == i).sum() <= 5:
+                out.append(mean)
+                continue
+
+            cov = np.cov(points[instances == i].T)
+            samples = multivariate_normal.rvs(mean, cov, size=1000, random_state=self.rng)
+            probs = multivariate_normal.pdf(samples, mean, cov)
+            
+            pos_mask = probs >= np.quantile(probs, 1 - self.pos_sample)
+            out.append(samples[pos_mask][0])
+        
+        data_dict['points'] = points
+        data_dict['instances'] = instances
+        data_dict['instance_centroids'] = np.stack(out)
+
+        return data_dict        
+
+    def __repr__(self) -> str:
+        return '\n'.join([
+            self.__class__.__name__ + '(',
+            f'    pos_sample: {self.pos_sample},',
             ')',
         ])
 
@@ -285,14 +325,6 @@ class PoseNormalize:
                 [-1, 0, 0],
                 [0, 1, 0],
                 [0, 0, -1],
-            ]) @ R
-
-        # rotate 180 degrees around z-axis if points are flipped
-        if (points[(points @ R.T)[:, 0] > 1] @ R.T).mean(0)[1] < 0:
-            R = np.array([
-                [-1, 0, 0],
-                [0, -1, 0],
-                [0, 0, 1],
             ]) @ R
         
         # rotate points to principal axes of decreasing explained variance
@@ -414,7 +446,7 @@ class NormalAsFeatures:
         normals: NDArray[Any],
         **data_dict: Dict[str, Any],
     ) -> Dict[str, Any]:
-        normals /= np.linalg.norm(normals, axis=-1, keepdims=True) + self.eps
+        normals = normals / (np.linalg.norm(normals, axis=-1, keepdims=True) + self.eps)
 
         if 'features' in data_dict:
             data_dict['features'] = np.concatenate(
@@ -431,13 +463,29 @@ class NormalAsFeatures:
         return self.__class__.__name__ + '()'
 
 
-class CentroidOffsetsAsFeatures:
+class ColorAsFeatures:
 
-    def __init__(
+    def __call__(
         self,
-        eps: float=1e-8,
-    ):
-        self.eps = eps
+        colors: NDArray[Any],
+        **data_dict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if 'features' in data_dict:
+            data_dict['features'] = np.concatenate(
+                (data_dict['features'], colors), axis=-1,
+            )
+        else:
+            data_dict['features'] = colors        
+            
+        data_dict['colors'] = colors
+
+        return data_dict
+
+    def __repr__(self) -> str:
+        return self.__class__.__name__ + '()'
+
+
+class CentroidOffsetsAsFeatures:
 
     def __call__(
         self,
@@ -512,7 +560,7 @@ class UniformDensityDownsample:
         data_dict['points'] = points[argmin]
         data_dict['point_count'] = argmin.shape[0]
 
-        for key in ['features', 'labels', 'instances', 'normals']:
+        for key in ['features', 'labels', 'types', 'instances', 'normals', 'colors', 'attributes']:
             if key not in data_dict:
                 continue
 
@@ -575,7 +623,7 @@ class BoundaryAwareDownsample(UniformDensityDownsample):
         data_dict['points'] = data_dict['points'][rand_idxs]
         data_dict['point_count'] = rand_idxs.shape[0]
 
-        for key in ['features', 'labels', 'instances']:
+        for key in ['features', 'labels', 'types', 'instances', 'attributes']:
             if key not in data_dict:
                 continue
 
@@ -607,37 +655,29 @@ class InstanceCentroids:
 
             return data_dict
 
-        labels, instances = data_dict['labels'], data_dict['instances']
-
-        if labels.shape[0] < points.shape[0]:
-            print('different shape!')
-            diff = points.shape[0] - labels.shape[0]
-            labels = np.concatenate((labels, [0]*diff))
-            instances = np.concatenate((instances, [0]*diff))
-            
-            data_dict['labels'] = labels
-            data_dict['instances'] = instances
-        elif labels.shape[0] > points.shape[0]:
-            print('different shape!')
-            diff = labels.shape[0] - points.shape[0]
-            labels = labels[:-diff]
-            instances = instances[:-diff]
-            
-            data_dict['labels'] = labels
-            data_dict['instances'] = instances
+        labels, types, instances = data_dict['labels'], data_dict['types'], data_dict['instances']
 
         instance_centroids = scatter_mean(
             src=torch.from_numpy(points),
             index=torch.from_numpy(instances),
             dim=0,
         ).numpy()
-
-        instance_point_idxs = np.bincount(instances).cumsum() - 1
-        instance_labels = labels[np.argsort(instances)[instance_point_idxs]]
+        
+        instance_labels = scatter_max(
+            src=torch.from_numpy(labels),
+            index=torch.from_numpy(instances),
+            dim=0,
+        )[0].numpy()
+        instance_types = scatter_max(
+            src=torch.from_numpy(types),
+            index=torch.from_numpy(instances),
+            dim=0,
+        )[0].numpy()
 
         data_dict['points'] = points
         data_dict['instance_centroids'] = instance_centroids
         data_dict['instance_labels'] = instance_labels
+        data_dict['instance_types'] = instance_types
         data_dict['instance_count'] = instance_labels.shape[0]
 
         return data_dict
@@ -752,138 +792,6 @@ class MatchLandmarksAndTeeth:
         ])
     
 
-class StructureLandmarks:
-
-    def __init__(
-        self,
-        include_cusps: bool=False,
-        to_left_right: bool=False,
-        separate_front_posterior: bool=True,
-    ):
-        from teethland.data.datasets import TeethLandDataset
-        self.landmark_classes = TeethLandDataset.landmark_classes
-        self.include_cusps = include_cusps
-        self.to_left_right = to_left_right
-        self.separate_front_posterior = separate_front_posterior
-
-        assert not to_left_right or not separate_front_posterior
-
-    def __call__(
-        self,
-        points: NDArray[Any],
-        **data_dict: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        # no-op if ground-truth data is unavailable
-        if 'labels' not in data_dict:
-            data_dict['points'] = points
-
-            return data_dict
-        
-        centroids = data_dict['instance_centroids']
-        land_coords = data_dict['landmark_coords']
-        land_classes = data_dict['landmark_classes']
-        land_instances = data_dict['landmark_instances']
-        
-        num_landmarks = 5 + 2 * self.separate_front_posterior + 5 * self.include_cusps
-        out = np.zeros((centroids.shape[0], num_landmarks, 3))
-        for i in range(centroids.shape[0]):
-            instance_mask = land_instances == i
-            fdi = data_dict['instance_labels'][i]
-
-            # no landmarks for this instance
-            if not np.any(instance_mask):
-                if i > 0: 
-                    print(data_dict['scan_file'], fdi, 'no landmarks')
-                continue
-            
-            # process the non-cusp landmarks
-            for k, v in self.landmark_classes.items():
-                if k == 'Cusp':
-                    continue
-                
-                num_landmarks = (land_classes[instance_mask] == v).sum()
-                if num_landmarks != 1:
-                    print(data_dict['scan_file'], fdi, k, num_landmarks)
-                    if num_landmarks == 0: continue
-
-                out[i, v] = land_coords[instance_mask & (land_classes == v)][-1]
-
-            # have more consistent mesial/distal landmarks as left-to-right landmarks
-            if self.to_left_right and fdi // 10 in [1, 4]:
-                mesial, distal = [self.landmark_classes[k] for k in ['Mesial', 'Distal']]
-                out[i, [mesial, distal]] = out[i, [distal, mesial]]
-            if self.separate_front_posterior and (fdi % 10) <= 3:
-                mesial, distal = [self.landmark_classes[k] for k in ['Mesial', 'Distal']]
-                if fdi // 10 in [1, 4]:
-                    left, right = distal, mesial
-                else:
-                    left, right = mesial, distal
-                    
-                out[i, [-2, -1]] = out[i, [left, right]]
-                out[i, [left, right]] = 0
-
-            # process the cusp landmarks
-            cusp_class = self.landmark_classes['Cusp']
-            cusps = land_classes[instance_mask] == cusp_class
-            if not self.include_cusps or cusps.sum() == 0:  # incisors, canines
-                continue
-            
-            # remove 6th cusp if it is present
-            cusp_coords = land_coords[instance_mask][cusps] - centroids[i]
-            if cusps.sum() == 6:  # two extra cusps
-                print(data_dict['scan_file'], fdi, '6 cusps')
-                dists = np.linalg.norm(cusp_coords[None] - cusp_coords[:, None], axis=-1)
-                dists = np.where(dists > 0, dists, 1e6)
-                pair = np.unravel_index(dists.argmin(), dists.shape)
-                remove_idx = pair[0] if cusp_coords[pair[0], 2] < cusp_coords[pair[1], 2] else pair[1]
-                cusps[np.nonzero(cusps)[0][remove_idx]] = False
-                cusp_coords = np.concatenate((cusp_coords[:remove_idx], cusp_coords[remove_idx + 1:]))
-
-            if (fdi % 10) in [2, 3, 4, 5] and cusps.sum() in [1, 2]:  # premolars
-                scores = np.stack((
-                    cusp_coords[:, :2] @ [1, 0],  # left
-                    cusp_coords[:, :2] @ [-1, 0],  # right
-                ))
-
-                dir_idxs, cusp_idxs = linear_sum_assignment(scores, maximize=True)
-                for dir_idx, cusp_idx in zip(dir_idxs, cusp_idxs):
-                    out[i, cusp_class + dir_idx] = land_coords[instance_mask][cusps][cusp_idx]
-            elif (fdi % 10) in [6, 7, 8] or cusps.sum() >= 3:  # molars
-                assert cusps.sum() in [1, 2, 3, 4, 5], f'Can only have 1 to 5 cusps for a molar, found {cusps.sum()}!'
-
-                scores = np.stack((
-                    cusp_coords[:, :2] @ [1, 1],  # top left
-                    cusp_coords[:, :2] @ [-1, 1],  # top right
-                    cusp_coords[:, :2] @ [1, -1],  # bottom left
-                    cusp_coords[:, :2] @ [-1, -1],  # bottom right
-                    cusp_coords[:, :2] @ [0, 0],  # extra
-                ))
-                
-                dir_idxs, cusp_idxs = linear_sum_assignment(scores, maximize=True)
-                for dir_idx, cusp_idx in zip(dir_idxs, cusp_idxs):
-                    out[i, cusp_class + dir_idx] = land_coords[instance_mask][cusps][cusp_idx]
-            else:
-                raise ValueError('Could not process cusps')
-            
-            if (fdi // 10) in [2, 3]:
-                out[i, [cusp_class, cusp_class + 1]] = out[i, [cusp_class + 1, cusp_class]]
-                out[i, [cusp_class + 2, cusp_class + 3]] = out[i, [cusp_class + 3, cusp_class + 2]]
-            
-        data_dict['points'] = points
-        data_dict['instance_landmarks'] = out
-
-        return data_dict
-    
-    def __repr__(self) -> int:
-        return '\n'.join([
-            self.__class__.__name__ + '(',
-            f'    include_cusps={self.include_cusps},',
-            f'    to_left_right={self.to_left_right},',
-            f'    separate_front_posterior={self.separate_front_posterior},',
-            ')',
-        ])
-    
-
 class GenerateProposals:
 
     def __init__(
@@ -891,10 +799,12 @@ class GenerateProposals:
         proposal_points: int,
         max_proposals: int,
         rng: Optional[np.random.Generator]=None,
+        label_as_instance: bool=False,
     ):
         self.proposal_points = proposal_points
         self.max_proposals = max_proposals
         self.rng = rng if rng is not None else np.random.default_rng()
+        self.label_as_instance = label_as_instance
 
     def __call__(
         self,
@@ -907,6 +817,10 @@ class GenerateProposals:
 
             return data_dict
         
+        _, counts = np.unique(data_dict['instances'], return_counts=True)
+        if counts[1:].max() > self.proposal_points:
+            print('Tooth points:', counts[1:].max(), ', Max points:', self.proposal_points)
+        
         unique_instances = np.unique(data_dict['instances'])[1:]
         instance_idxs = np.sort(self.rng.choice(
             unique_instances,
@@ -915,12 +829,6 @@ class GenerateProposals:
         ))
 
         centroids = data_dict['instance_centroids'][instance_idxs]
-        if 'instance_landmarks' in data_dict:
-            instance_landmarks = data_dict['instance_landmarks'][instance_idxs]
-            landmark_mask = np.any(instance_landmarks != 0, axis=-1, keepdims=True)
-            instance_landmarks = np.where(landmark_mask, instance_landmarks - centroids[:, None], 0.0)
-            data_dict['instance_landmarks'] = instance_landmarks
-        
         if 'landmark_coords' in data_dict:
             coords = data_dict['landmark_coords']
             classes = data_dict['landmark_classes']
@@ -941,14 +849,19 @@ class GenerateProposals:
 
         dists = np.linalg.norm(points[None] - centroids[:, None], axis=-1)
         point_idxs = np.argsort(dists, axis=1)[:, :self.proposal_points]
-        fg_masks = data_dict['instances'][point_idxs] == instance_idxs[:, None]
-        assert np.all(np.any(fg_masks, 1))
+        labels = (data_dict['instances'][point_idxs] == instance_idxs[:, None]).astype(int)
+        if self.label_as_instance:
+            fg_mask = data_dict['labels'][point_idxs] == instance_idxs[:, None]
+            labels = labels + fg_mask
 
         data_dict['points'] = points[point_idxs]
         data_dict['normals'] = data_dict['normals'][point_idxs]
-        data_dict['labels'] = fg_masks.astype(int)
+        if 'colors' in data_dict: data_dict['colors'] = data_dict['colors'][point_idxs]
+        if 'attributes' in data_dict: data_dict['attributes'] = data_dict['attributes'][point_idxs]
+        data_dict['labels'] = labels
         data_dict['centroids'] = centroids
         data_dict['point_count'] = np.array([self.proposal_points]).repeat(centroids.shape[0])
+        data_dict['point_idxs'] = point_idxs
         data_dict['instance_count'] = centroids.shape[0]
 
         return data_dict
@@ -958,5 +871,306 @@ class GenerateProposals:
             self.__class__.__name__ + '(',
             f'    proposal_points={self.proposal_points},',
             f'    max_proposals={self.max_proposals},',
+            ')',
+        ])
+    
+
+class AlignUpForward:
+
+    def __init__(
+        self,
+        basis: NDArray[Any]=np.array([
+            [-1, 0, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+        ]),
+    ):
+        self.basis = basis
+    
+    def __call__(
+        self,
+        **data_dict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # no-op if ground-truth data is unavailable
+        if 'instances' not in data_dict:
+            return data_dict
+        
+        is_front = np.isin(data_dict['instance_labels'], [11, 21, 31, 41])
+        is_left = np.isin(data_dict['instance_labels'], [16, 36])
+        is_right = np.isin(data_dict['instance_labels'], [26, 46])
+
+        front_c = data_dict['instance_centroids'][is_front].mean(0)
+        left_c = data_dict['instance_centroids'][is_left][0]
+        right_c = data_dict['instance_centroids'][is_right][0]
+
+        dir_up = np.cross(left_c - front_c, right_c - front_c)
+        dir_up /= np.linalg.norm(dir_up)
+
+        dir_right = right_c - left_c
+        dir_right /= np.linalg.norm(dir_right)
+
+        lhs = front_c - left_c
+        dotp = lhs @ dir_right
+        back_c = left_c + dir_right * dotp
+        dir_forward = front_c - back_c
+        dir_forward /= np.linalg.norm(dir_forward)
+
+        T = np.eye(4)
+        T[:3, :3] = self.basis @ np.stack((dir_right, dir_forward, dir_up))
+
+        data_dict['points'] = data_dict['points'] @ T[:3, :3].T
+        data_dict['normals'] = data_dict['normals'] @ T[:3, :3].T
+        data_dict['affine'] = T @ data_dict.get('affine', np.eye(4))
+        data_dict['instance_centroids'] = data_dict['instance_centroids'] @ T[:3, :3].T
+
+        data_dict['dir_right'] = self.basis[0]
+        data_dict['dir_fwd'] = self.basis[1]
+        data_dict['dir_up'] = self.basis[2]
+        data_dict['trans'] = np.zeros(3)
+
+        return data_dict
+
+    def __repr__(self) -> str:
+        return '\n'.join([
+            self.__class__.__name__ + '(',
+            f'    basis={self.basis},',
+            ')',
+        ])
+    
+
+class RandomRotate:
+
+    def __init__(
+        self,
+        rng: Optional[np.random.Generator],
+    ):
+        self.rng = rng if rng is not None else np.random.default_rng()
+        self.pose_normalize = PoseNormalize()
+
+    def __call__(
+        self,
+        points: NDArray[Any],
+        normals: NDArray[Any],
+        instance_centroids: NDArray[Any],
+        **data_dict: Dict[str, Any],
+    ):
+        degrees = self.rng.random(3) * 360 - 180
+        r = Rotation.from_euler('xyz', angles=degrees, degrees=True)
+        T = np.eye(4)
+        T[:3, :3] = r.as_matrix()
+
+        # apply PCA to get a rough position
+        T = self.pose_normalize(
+            points=points @ T[:3, :3].T,
+            normals=normals @ T[:3, :3].T,
+            affine=T,
+        )['affine']
+
+        data_dict['points'] = points @ T[:3, :3].T
+        data_dict['normals'] = normals @ T[:3, :3].T
+        data_dict['affine'] = T @ data_dict.get('affine', np.eye(4))
+        data_dict['instance_centroids'] = instance_centroids @ T[:3, :3].T
+
+        if 'dir_right' in data_dict:
+            data_dict['dir_right'] = data_dict['dir_right'] @ T[:3, :3].T
+            data_dict['dir_up'] = data_dict['dir_up'] @ T[:3, :3].T
+            data_dict['dir_fwd'] = data_dict['dir_fwd'] @ T[:3, :3].T
+            data_dict['trans'] = data_dict['trans'] @ T[:3, :3].T
+
+        return data_dict
+
+    def __repr__(self) -> str:
+        return self.__class__.__name__ + '()'
+
+
+class RandomPartial:
+
+    def __init__(
+        self,
+        rng: Optional[np.random.Generator]=None,
+        count_range: Tuple[int, int]=(2, 12),
+        keep_radius: float=0.40,  # approximatly 14mm teeth
+        p: float=0.9,
+        skew: float=-0.9,
+        min_points: int=0,
+        do_translate: bool=True,
+        do_planes: bool=True,
+        do_single_component: bool=True,
+    ):
+        self.rng = rng if rng is not None else np.random.default_rng()
+        self.range = count_range
+        self.keep_radius = keep_radius
+        self.p = p
+        self.min_points = min_points
+        self.do_translate = do_translate
+        self.do_planes = do_planes
+        self.do_single_component = do_single_component
+
+        num_counts = count_range[1] - count_range[0] + 1
+        middle_idx = (num_counts - 1) // 2
+        probs = np.full((num_counts,), 1 / num_counts)
+        for i in range(num_counts):
+            bias = np.trunc(i - (num_counts - 1) / 2) / middle_idx
+            probs[i] += bias * probs[middle_idx] * skew
+
+        self.probs = probs
+
+    def determine_inside(
+        self,
+        points,
+        centroids,
+    ):
+        normal = centroids[-1] - centroids[0]
+        normal /= np.linalg.norm(normal)
+        point1 = centroids[0] - self.keep_radius * normal
+        point2 = centroids[-1] + self.keep_radius * normal
+        plane1 = np.concatenate((normal, [-normal @ point1]))
+        plane2 = np.concatenate((-normal, [normal @ point2]))
+
+        middle_point = (centroids[0] + centroids[-1]) / 2
+        normal = np.cross(normal, middle_point + [0, 0, 1] - centroids[0])
+        normal /= np.linalg.norm(normal)
+        point1 = centroids[((centroids - middle_point) @ normal).argmin()] - self.keep_radius * normal
+        point2 = centroids[((centroids - middle_point) @ normal).argmax()] + self.keep_radius * normal
+        plane3 = np.concatenate((normal, [-normal @ point1]))
+        plane4 = np.concatenate((-normal, [normal @ point2]))
+
+        # determine points inside planes
+        coords_homo = np.column_stack((points, np.ones(points.shape[0])))
+        is_inside = (
+            ((coords_homo @ plane1) >= 0)
+            & ((coords_homo @ plane2) >= 0)
+            & ((coords_homo @ plane3) >= 0)
+            & ((coords_homo @ plane4) >= 0)
+        )
+
+        return is_inside
+
+    def single_connected_component(
+        self,
+        points,
+        triangles,
+        mask,
+        tooth_coord,
+    ):    
+        # get vertex mask and triangles
+        inside_triangles = triangles[np.all(mask[triangles], axis=-1)]
+        
+        vertex_mask = np.zeros_like(mask)
+        vertex_mask[inside_triangles.flatten()] = True
+        
+        vertex_map = np.full((points.shape[0],), -1)
+        vertex_map[vertex_mask] = np.arange(vertex_mask.sum())
+        inside_triangles = vertex_map[inside_triangles]
+
+        # determine component idxs
+        edges = np.concatenate((
+            inside_triangles[:, [0, 1]],
+            inside_triangles[:, [0, 2]],
+            inside_triangles[:, [1, 2]],
+        ))        
+        G = networkx.Graph(list(edges))
+        dists = np.linalg.norm(points[vertex_mask] - tooth_coord, axis=-1)
+        comp_idxs = np.array(list(networkx.node_connected_component(G, dists.argmin())))
+
+        # get final mask
+        final_mask = np.zeros_like(mask)
+        final_mask[np.nonzero(vertex_mask)[0][comp_idxs]] = True
+
+        return final_mask
+
+    def __call__(
+        self,
+        points: NDArray[Any],
+        triangles: NDArray[Any],
+        **data_dict: Dict[str, Any],
+    ):
+        if self.rng.random() > self.p:
+            data_dict['points'] = points
+            data_dict['triangles'] = triangles
+            return data_dict
+        
+        # determine a sequence based on FDI labels
+        fdis = data_dict['instance_labels']
+        q1 = (fdis > 10) & (fdis < 20)
+        q2 = (fdis > 20) & (fdis < 30)
+        q3 = (fdis > 30) & (fdis < 40)
+        q4 = (fdis > 40) & (fdis < 50)        
+        sort_idxs = np.concatenate((
+            np.nonzero(q1)[0][np.argsort(fdis[q1])[::-1]],
+            np.nonzero(q2)[0][np.argsort(fdis[q2])],
+            np.nonzero(q3)[0][np.argsort(fdis[q3])[::-1]],
+            np.nonzero(q4)[0][np.argsort(fdis[q4])],
+        ))
+        while True:
+            # sample number of teeth
+            count_range = np.arange(self.range[0], min(self.range[1], sort_idxs.shape[0]) + 1)
+            probs = self.probs[:count_range.shape[0]] / sum(self.probs[:count_range.shape[0]])
+            num_teeth = self.rng.choice(count_range, p=probs)
+
+            # sample consecutive teeth
+            start_tooth = self.rng.integers(sort_idxs.shape[0] - num_teeth, endpoint=True)
+            tooth_idxs = sort_idxs[start_tooth:start_tooth + num_teeth]
+
+            centroids = data_dict['instance_centroids'][tooth_idxs]
+            if self.do_planes:
+                # determine points inside of four planes
+                vertex_mask = self.determine_inside(points, centroids)
+
+                # determine largest area with connected triangles
+                if self.do_single_component:
+                    vertex_mask = self.single_connected_component(
+                        points, triangles, vertex_mask, centroids[0],
+                    )
+            else:
+                # keep the points close to centroids of selected teeth
+                dists = np.linalg.norm(points[None] - centroids[:, None], axis=-1).min(0)
+                vertex_mask = dists < self.keep_radius
+
+            if vertex_mask.sum() >= self.min_points:
+                break
+
+        # update triangles
+        if self.do_single_component:
+            vertex_map = np.full((points.shape[0],), -1)
+            vertex_map[vertex_mask] = torch.arange(vertex_mask.sum())
+            triangles = vertex_map[triangles]
+            triangles = triangles[np.all(triangles >= 0, axis=-1)]
+
+        data_dict['points'] = points[vertex_mask]
+        data_dict['normals'] = data_dict['normals'][vertex_mask]
+        data_dict['colors'] = data_dict['colors'][vertex_mask]
+        data_dict['labels'] = data_dict['labels'][vertex_mask]
+        data_dict['types'] = data_dict['types'][vertex_mask]
+        data_dict['attributes'] = data_dict['attributes'][vertex_mask]
+        data_dict['instances'] = data_dict['instances'][vertex_mask]
+        data_dict['point_count'] = vertex_mask.sum()
+        data_dict['triangles'] = triangles
+        data_dict['triangle_count'] = triangles.shape[0]
+
+        if not self.do_translate:
+            return data_dict
+
+        trans = -points[vertex_mask].mean(0)
+        data_dict['points'] = data_dict['points'] + trans
+        data_dict['instance_centroids'] = data_dict['instance_centroids'] + trans
+        T = np.eye(4)
+        T[:3, 3] = trans
+        data_dict['affine'] = T @ data_dict.get('affine', np.eye(4))
+        data_dict['trans'] = data_dict.get('trans', np.zeros(3)) + trans
+
+        return data_dict
+
+    def __repr__(self) -> str:
+        return '\n'.join([
+            self.__class__.__name__ + '(',
+            f'    range={self.range},',
+            f'    keep_radius={self.keep_radius},',
+            f'    p={self.p},',
+            f'    min_points={self.min_points},',
+            f'    do_translate={self.do_translate},',
+            f'    do_planes={self.do_planes},',
+            f'    do_single_component={self.do_single_component},',
+            f'    probs={self.probs},',
             ')',
         ])

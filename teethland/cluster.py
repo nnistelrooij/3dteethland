@@ -7,10 +7,10 @@ def learned_region_cluster(
     sigmas,
     seeds,
     min_seed_score: float=0.9,
-    min_cluster_size: int=20,
-    min_unclustered: float=0.35,
+    min_cluster_size: int=16,
+    min_unclustered: float=0.4,
 ):
-    out = [torch.full((n,1), -1).to(seeds.F).long() for n in seeds.batch_counts]
+    clusters = [torch.full((n,1), -1).to(seeds.F).long() for n in seeds.batch_counts]
 
     # determine spatial embeddings
     instance_idx = 0
@@ -25,8 +25,8 @@ def learned_region_cluster(
         spatial_embeds = offsets_b + offsets.batch(b).C
         while mask_b.sum() >= min_cluster_size:
             voxel_idx = (seeds_b * mask_b).argmax()
-            mask_b[voxel_idx] = False
             if seeds_b[voxel_idx] < min_seed_score:
+                mask_b[voxel_idx] = False
                 break
 
             center = spatial_embeds[voxel_idx]
@@ -36,74 +36,84 @@ def learned_region_cluster(
                 dim=1,
                 keepdim=True,
             ))  # 1 x d x h x w
-            proposal = probs > 0.5
+            proposal = probs >= 0.7
 
             num_points = proposal.sum()
             overlap = mask_b[proposal].sum() / num_points
-            if num_points >= min_cluster_size and overlap >= min_unclustered:
-                out[b][proposal] = instance_idx
+            if (
+                num_points >= min_cluster_size
+                and overlap >= min_unclustered
+            ):
+                clusters[b][proposal & mask_b] = instance_idx
                 instance_idx += 1
             
             mask_b[proposal] = False
-
-    out = seeds.new_tensor(features=torch.cat(out)[:, 0])
+    
+    # remove small clusters 
+    clusters = torch.cat(clusters)[:, 0]
+    _, counts = torch.unique(clusters, return_counts=True)
+    clusters[(counts < min_cluster_size)[clusters + 1]] = -1
+    clusters = torch.unique(clusters, return_inverse=True)[1] - 1
+        
+    # return a PointTensor
+    out = seeds.new_tensor(features=clusters)
 
     return out
 
 
 def wdbscan(
-	dmatrix: TensorType['K', 'K', torch.float32],
-	epsilon: float,
-	mu: float,
-	weights=None,
-	noise=True,
+    dmatrix: TensorType['K', 'K', torch.float32],
+    epsilon: float,
+    mu: float,
+    weights=None,
+    noise=True,
 ):
-	"""
-	Generates a density-based clustering of arbitrary shape. Returns a numpy
-	array coding cluster membership with noise observations coded as 0.
-	
-	Positional arguments:
-	dmatrix -- square dissimilarity matrix (cf. numpy.matrix, numpy.squareform,
-	           and numpy.pdist).
-	epsilon -- maximum reachability distance.
-	mu      -- minimum reachability weight (cf. minimum number of points in the
-	           classical DBSCAN).
-	
-	Keyword arguments:
-	weights -- weight array (if None, weights default to 1).
-	noise   -- Boolean indicating whether objects that do not belong to any
-	           cluster should be considered as noise (if True) or assigned to
-	           clusters of their own (if False).
-	"""
-	n = dmatrix.shape[0]
-	ematrix = dmatrix <= epsilon # Epsilon-reachability matrix
-	if weights is None:
-		weights = torch.ones(n, dtype=torch.int64, device=dmatrix.device) # Classical DBSCAN
-	status = torch.zeros(n, dtype=torch.int64, device=dmatrix.device) # Unclassified = 0
-	cluster_id = 1 # Classified = 1, 2, ...
-	for i in range(n):
-		if status[i] != 0:  # already clustered
-			continue
-		
-		seeds = ematrix[i].clone()
-		if weights[seeds].sum() < mu:  # no dense neighborhood
-			status[i] = -1 # Noise = -1
-			continue
-		
-		status[seeds] = cluster_id
-		seeds[i] = False
-		while torch.any(seeds):
-			j = torch.argmax(seeds.float())
-			eneighborhood = torch.nonzero(ematrix[j])[:, 0]
-			seeds[j] = False
-			if weights[eneighborhood].sum() < mu:
-				continue
+    """
+    Generates a density-based clustering of arbitrary shape. Returns a numpy
+    array coding cluster membership with noise observations coded as 0.
+    
+    Positional arguments:
+    dmatrix -- square dissimilarity matrix (cf. numpy.matrix, numpy.squareform,
+               and numpy.pdist).
+    epsilon -- maximum reachability distance.
+    mu      -- minimum reachability weight (cf. minimum number of points in the
+               classical DBSCAN).
+    
+    Keyword arguments:
+    weights -- weight array (if None, weights default to 1).
+    noise   -- Boolean indicating whether objects that do not belong to any
+               cluster should be considered as noise (if True) or assigned to
+               clusters of their own (if False).
+    """
+    n = dmatrix.shape[0]
+    ematrix = dmatrix <= epsilon # Epsilon-reachability matrix
+    if weights is None:
+        weights = torch.ones(n, dtype=torch.int64, device=dmatrix.device) # Classical DBSCAN
+    status = torch.zeros(n, dtype=torch.int64, device=dmatrix.device) # Unclassified = 0
+    cluster_id = 1 # Classified = 1, 2, ...
+    for i in range(n):
+        if status[i] != 0:  # already clustered
+            continue
+        
+        seeds = ematrix[i].clone()
+        if weights[seeds].sum() < mu:  # no dense neighborhood
+            status[i] = -1 # Noise = -1
+            continue
+        
+        status[seeds] = cluster_id
+        seeds[i] = False
+        while torch.any(seeds):
+            j = torch.argmax(seeds.float())
+            eneighborhood = torch.nonzero(ematrix[j])[:, 0]
+            seeds[j] = False
+            if weights[eneighborhood].sum() < mu:
+                continue
 
-			seeds[eneighborhood[status[eneighborhood] == 0]] = True
-			status[eneighborhood[status[eneighborhood] <= 0]] = cluster_id
-			
-		cluster_id += 1
-	if not noise: # Assign cluster ids to noise
-		noisy = (status == -1)
-		status[noisy] = torch.arange(cluster_id, cluster_id + noisy.sum()).to(status)
-	return status
+            seeds[eneighborhood[status[eneighborhood] == 0]] = True
+            status[eneighborhood[status[eneighborhood] <= 0]] = cluster_id
+            
+        cluster_id += 1
+    if not noise: # Assign cluster ids to noise
+        noisy = (status == -1)
+        status[noisy] = torch.arange(cluster_id, cluster_id + noisy.sum()).to(status)
+    return status

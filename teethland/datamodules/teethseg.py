@@ -2,12 +2,14 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import List, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pytorch_lightning as pl
 from skmultilearn.model_selection import IterativeStratification
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
+
+from teethland.data.samplers import ClassAwareSampler, InstanceBalancedSampler
 
 
 class TeethSegDataModule(pl.LightningDataModule):
@@ -18,6 +20,8 @@ class TeethSegDataModule(pl.LightningDataModule):
         root: Union[str, Path],
         regex_filter: str,
         extensions: str,
+        fold: int,
+        norm: bool,
         clean: bool,
         val_size: float,
         include_val_as_train: bool,
@@ -26,6 +30,7 @@ class TeethSegDataModule(pl.LightningDataModule):
         pin_memory: bool,
         persistent_workers: bool,
         seed: int,
+        sampler: Literal['default', 'balanced'],
         **kwargs,
     ):        
         super().__init__()
@@ -33,6 +38,8 @@ class TeethSegDataModule(pl.LightningDataModule):
         self.root = Path(root)
         self.filter = f'/(?!{os.sep}\.)[^{os.sep}\.]*({regex_filter})'
         self.extensions = extensions
+        self.fold = fold
+        self.norm = norm
         self.clean = clean
         self.val_size = val_size
         self.include_val_as_train = include_val_as_train
@@ -41,6 +48,7 @@ class TeethSegDataModule(pl.LightningDataModule):
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers
         self.seed =  seed
+        self.sampler = sampler
 
     def _files(
         self,
@@ -90,6 +98,21 @@ class TeethSegDataModule(pl.LightningDataModule):
     ) -> Tuple[List[Tuple[Path, Path, '...']]]:
         if len(files) <= 1:
             return files, []
+        
+        # keep the split of a previous stage or run, if validation fold is specified
+        if isinstance(self.fold, str):
+            with open(self.fold, 'r') as f:
+                val_mesh_files = [l.strip() for l in f.readlines() if l.strip()]
+            val_mesh_stems = ['_'.join(f[:-4].split('_')[:2]) for f in val_mesh_files]
+
+            mesh_files = [fs[0] if isinstance(fs, tuple) else fs for fs in files]
+            mesh_files = ['_'.join(f.stem.split('_')[:2]) for f in mesh_files]
+            train_files = [fs for i, fs in enumerate(files) if mesh_files[i] not in val_mesh_stems]
+            val_files = [fs for i, fs in enumerate(files) if mesh_files[i] in val_mesh_stems]
+            if self.include_val_as_train:
+                train_files += val_files
+
+            return train_files, val_files
 
         # determine classes and mesh and annotation files of each subject
         subject_idxs = {}
@@ -99,8 +122,14 @@ class TeethSegDataModule(pl.LightningDataModule):
             with open(self.root / case_files[1], 'rb') as f:
                 annotation = json.load(f)
 
-            subject = re.split('_|-', case_files[0].stem)[0]
-            labels = np.unique(annotation['labels'])
+            # subject = '_'.join(re.split('_|-', case_files[0].stem)[:-1])
+            subject = case_files[0].stem.split('_')[0]
+            labels = np.array(annotation['labels'])
+            _, instances, counts = np.unique(
+                annotation['instances'], return_inverse=True, return_counts=True,
+            )
+            labels[(counts < 30)[instances]] = 0
+            labels = np.unique(labels)
 
             subject_idx = subject_idxs.setdefault(subject, len(subject_idxs))
             subject_files[subject_idx].append(case_files)
@@ -113,17 +142,25 @@ class TeethSegDataModule(pl.LightningDataModule):
 
         # split subjects with stratification on multi-labels
         stratifier = IterativeStratification(
-            n_splits=2,
+            n_splits=5,
             order=2,
-            sample_distribution_per_fold=[self.val_size, 1 - self.val_size],
         )
-        train_idxs, val_idxs = next(stratifier.split(
+        splits = list(stratifier.split(
             X=subject_files,
             y=subject_labels,
         ))
+
+        # write folds to storage for documentation
+        for i, (_, fold_idxs) in enumerate(splits):
+            with open(f'zainab_fold_{i}.txt', 'w') as f:
+                for subject_idx in fold_idxs:
+                    for fs in subject_files[subject_idx]:
+                        f.write(fs[0].name + '\n')
+        
+        # determine train and validation files of current run
+        train_idxs, val_idxs = splits[self.fold]
         train_files = [f for i in train_idxs for f in subject_files[i]]
         val_files = [f for i in val_idxs for f in subject_files[i]]
-
         if self.include_val_as_train:
             train_files += val_files
 
@@ -133,11 +170,13 @@ class TeethSegDataModule(pl.LightningDataModule):
         self,
         dataset: Dataset,
         shuffle: bool=False,
+        sampler: Optional[Sampler]=None,
     ) -> DataLoader:
         return DataLoader(
             dataset=dataset,
             batch_size=self.batch_size,
             shuffle=shuffle,
+            sampler=sampler,
             num_workers=self.num_workers,
             collate_fn=self.collate_fn,
             pin_memory=self.pin_memory,
@@ -145,7 +184,13 @@ class TeethSegDataModule(pl.LightningDataModule):
         )
 
     def train_dataloader(self) -> DataLoader:
-        return self._dataloader(self.train_dataset, shuffle=True)
+        if self.sampler == 'balanced':
+            sampler = InstanceBalancedSampler(self.train_dataset)
+        elif self.sampler == 'binary':
+            sampler = ClassAwareSampler(self.train_dataset)
+        else:
+            sampler = None
+        return self._dataloader(self.train_dataset, sampler=sampler)
 
     def val_dataloader(self) -> DataLoader:
         return self._dataloader(self.val_dataset)

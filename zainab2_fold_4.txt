@@ -1,0 +1,12 @@
+A20_lower.ply
+A20_upper.ply
+A32- 01-2016, CCEUA 245191_lower.ply
+A32- 01-2016, CCEUA 245191_upper.ply
+A11_lower.ply
+A11_upper.ply
+A30- 01-2012, B3ZNM 555856_lower.ply
+A30- 01-2012, B3ZNM 555856_upper.ply
+A22_lower.ply
+A22_upper.ply
+A1_lower.ply
+A1_upper.ply

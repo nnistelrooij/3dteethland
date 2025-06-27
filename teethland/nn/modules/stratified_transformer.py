@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -27,7 +27,7 @@ class StratifiedTransformer(nn.Module):
         self,
         in_channels: int,
         channels_list: List[int],
-        out_channels: Union[List[int], int],
+        out_channels: Optional[Union[List[int], int]],
         depths: List[int],
         heads_list: List[int],
         window_sizes: List[int],
@@ -64,6 +64,14 @@ class StratifiedTransformer(nn.Module):
             channels_list[point_embedding['use']:], downsample_ratio,
         )
 
+        self.enc_channels = channels_list[-1]
+        self.use_point_embedding = point_embedding['use']
+        self.transformer_lr_ratio = transformer_lr_ratio
+
+        if out_channels is None:
+            self.out_channels = None
+            return
+
         if not isinstance(out_channels, list):
             out_channels = [out_channels]
         self.upsample_blocks, self.heads = nn.ModuleList(), nn.ModuleList()
@@ -79,13 +87,10 @@ class StratifiedTransformer(nn.Module):
                 bias=True,
             ) if channels is not None else nn.Identity())
 
-        self.enc_channels = channels_list[-1]
         self.out_channels = [
             channels_list[point_embedding['use']] if chs is None else chs
             for chs in out_channels
         ]
-        self.use_point_embedding = point_embedding['use']
-        self.transformer_lr_ratio = transformer_lr_ratio
 
     def init_point_embedding(
         self,
@@ -192,7 +197,7 @@ class StratifiedTransformer(nn.Module):
                 'lr': lr,
                 'name': 'downsample_blocks',
             },
-            {
+            *([{
                 'params': self.upsample_blocks.parameters(),
                 'lr': lr,
                 'name': 'upsample_blocks',
@@ -201,7 +206,7 @@ class StratifiedTransformer(nn.Module):
                 'params': self.heads.parameters(),
                 'lr': lr,
                 'name': 'heads',
-            },
+            }] if self.out_channels is not None else [])
         ]
 
     def forward(self, x: PointTensor) -> Union[
@@ -226,6 +231,9 @@ class StratifiedTransformer(nn.Module):
             x_ups.insert(0, x)
             x = downsample_block(x)
             x = transformer(x)
+
+        if self.out_channels is None:
+            return x
 
         # save encoded input for further processing
         encoding = x

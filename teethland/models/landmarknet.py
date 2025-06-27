@@ -10,7 +10,12 @@ from torchmetrics.classification import (
 from torchmetrics.regression import MeanSquaredError
 from torchtyping import TensorType
 
+import teethland
 from teethland import PointTensor
+from teethland.metrics import (
+    LandmarkF1Score,
+    LandmarkMeanAveragePrecision,
+)
 import teethland.nn as nn
 from teethland.optim.lr_scheduler import (
     CosineAnnealingLR,
@@ -30,19 +35,14 @@ class LandmarkNet(pl.LightningModule):
         weight_decay: float,
         epochs: int,
         warmup_epochs: int,
-        num_classes: int,
+        dbscan_cfg: dict,
         **model_args: Dict[str, Any],
     ):
         super().__init__()
 
         model_args.pop('checkpoint_path', None)
-        self.backbone = nn.StratifiedTransformer(
-            out_channels=[1, None, 1 + 3],
+        self.model = nn.StratifiedTransformer(
             **model_args,
-        )
-        self.map_mlp = nn.MaskedAveragePooling(
-            num_features=self.backbone.out_channels[1],
-            out_channels=num_classes * 4,
         )
 
         self.landmark_criterion = nn.LandmarkLoss()
@@ -51,97 +51,133 @@ class LandmarkNet(pl.LightningModule):
         self.dice = BinaryF1Score()
         self.iou = BinaryJaccardIndex()
         self.mse = MeanSquaredError()
+        self.landmark_f1 = LandmarkF1Score()
+        self.landmark_map = LandmarkMeanAveragePrecision()
 
         self.lr = lr
         self.weight_decay = weight_decay
         self.epochs = epochs
         self.warmup_epochs = warmup_epochs
+        self.dbscan_cfg = dbscan_cfg
 
     def forward(
         self,
         x: PointTensor,
-        labels: PointTensor,
-    ) -> Tuple[PointTensor, PointTensor, PointTensor, PointTensor]:
-        _, (seg, features, point_offsets) = self.backbone(x)
-        prototypes, instance_offsets = self.map_mlp(features, labels)
+    ) -> Tuple[PointTensor, PointTensor, PointTensor, PointTensor, PointTensor, PointTensor]:
+        _, (seg, mesial_distal, facial, outer, inner, cusps) = self.model(x)
 
-        return seg, prototypes, instance_offsets, point_offsets
+        return seg, mesial_distal, facial, outer, inner, cusps
 
     def training_step(
         self,
-        batch: Tuple[PointTensor, Tuple[PointTensor, PointTensor, PointTensor]],
+        batch: Tuple[PointTensor, Tuple[PointTensor, PointTensor]],
         batch_idx: int,
     ) -> TensorType[torch.float32]:
-        x, (instances, landmarks, labels) = batch
+        x, (landmarks, labels) = batch
 
-        seg, prototypes, instance_offsets, point_offsets = self(x, labels)
+        seg, mesial_distal, facial, outer, inner, cusps = self(x)
 
         seg_loss = self.seg_criterion(seg, labels)
-        instances_loss, points_loss = self.landmark_criterion(
-            prototypes, instance_offsets, point_offsets, instances, landmarks,
-        )
+        mesial_distal_loss = self.landmark_criterion(mesial_distal, landmarks, [0, 1])
+        facial_loss = self.landmark_criterion(facial, landmarks, [2])
+        outer_loss = self.landmark_criterion(outer, landmarks, [3])
+        inner_loss = self.landmark_criterion(inner, landmarks, [4])
+        cusps_loss = self.landmark_criterion(cusps, landmarks, [5])
 
-        loss = seg_loss + instances_loss + points_loss
-
-        log_dict = {
+        loss = {
             'loss/train_seg': seg_loss,
-            'loss/train_instances': instances_loss,
-            'loss/train_points': points_loss,
-            'loss/train': loss,
+            'loss/train_mesial_distal': mesial_distal_loss,
+            'loss/train_facial': facial_loss,
+            'loss/train_outer': outer_loss,
+            'loss/train_inner': inner_loss,
+            'loss/train_cusps': cusps_loss,
         }
         
         # self.mse(coords.F[instances.F[:, -1] == 1], instances.F[instances.F[:, -1] == 1, :-1])
         self.dice((seg.F[:, 0] >= 0).long(), (labels.F >= 0).long())
-        log_dict.update({'dice/train': self.dice})
 
+        log_dict = {
+            **loss,
+            'loss/train': sum([v for v in loss.values()]),
+            'dice/train': self.dice,
+        }
         self.log_dict(log_dict, batch_size=x.batch_size, sync_dist=True)
 
-        return loss
+        return sum([v for v in loss.values()])
 
     def validation_step(
         self,
-        batch: Tuple[PointTensor, Tuple[PointTensor, PointTensor, PointTensor]],
+        batch: Tuple[PointTensor, Tuple[PointTensor, PointTensor]],
         batch_idx: int,
-    ):
-        x, (instances, landmarks, labels) = batch
+    ) -> Tuple[PointTensor, PointTensor]:
+        x, (landmarks, labels) = batch
 
-        seg, prototypes, instance_offsets, point_offsets = self(x, labels)
-
-        from teethland.visualization import draw_landmarks
-        # draw_landmarks(x.batch(0).F[:, -3:].cpu().numpy(), instance_offsets.F.reshape(-1, 5, 4)[0, :, :3].cpu().numpy())
-        # points_mask = torch.argsort(point_offsets.batch(0).F[:, 0])[:200]
-        # landmarks.batch(0).F
-        # draw_landmarks(x.batch(0).C.cpu().numpy(), (x.batch(0).C + point_offsets.batch(0).F[:, 1:])[points_mask].cpu().numpy())
+        seg, mesial_distal, facial, outer, inner, cusps = self(x)
 
         seg_loss = self.seg_criterion(seg, labels)
-        instances_loss, points_loss = self.landmark_criterion(
-            prototypes, instance_offsets, point_offsets, instances, landmarks,
-        )
+        mesial_distal_loss = self.landmark_criterion(mesial_distal, landmarks, [0, 1])
+        facial_loss = self.landmark_criterion(facial, landmarks, [2])
+        outer_loss = self.landmark_criterion(outer, landmarks, [3])
+        inner_loss = self.landmark_criterion(inner, landmarks, [4])
+        cusps_loss = self.landmark_criterion(cusps, landmarks, [5])
 
-        loss = seg_loss + instances_loss + points_loss
-
-        log_dict = {
+        loss = {
             'loss/val_seg': seg_loss,
-            'loss/val_instances': instances_loss,
-            'loss/val_points': points_loss,
-            'loss/val': loss,
+            'loss/val_mesial_distal': mesial_distal_loss,
+            'loss/val_facial': facial_loss,
+            'loss/val_outer': outer_loss,
+            'loss/val_inner': inner_loss,
+            'loss/val_cusps': cusps_loss,
         }
         
         # self.mse(coords.F[instances.F[:, -1] == 1], instances.F[instances.F[:, -1] == 1, :-1])
         self.dice((seg.F[:, 0] >= 0).long(), (labels.F >= 0).long())
-        log_dict.update({'dice/val': self.dice})
 
+
+        log_dict = {
+            **loss,
+            'loss/val': sum([v for v in loss.values()]),
+            'dice/val': self.dice,
+        }
+
+        # if self.trainer.current_epoch == 0:
         self.log_dict(log_dict, batch_size=x.batch_size, sync_dist=True)
+        return
+
+        # process point-level landmarks
+        # landmarks_list = []
+        # for i, offsets in enumerate([mesial_distal, facial, outer, inner, cusps]):
+        #     kpt_mask = offsets.F[:, 0] < 0.12
+        #     coords = x.C + offsets.F[:, 1:]
+        #     dists = torch.clip(offsets.F[:, 0], 0, 0.12)
+        #     weights = (0.12 - dists) / 0.12
+        #     landmarks = PointTensor(
+        #         coordinates=coords[kpt_mask],
+        #         features=weights[kpt_mask],
+        #         batch_counts=torch.bincount(
+        #             input=x.batch_indices[kpt_mask],
+        #             minlength=x.batch_size,
+        #         ),
+        #     )
+        #     landmarks = landmarks.cluster(**self.dbscan_cfg)
+        #     landmarks = landmarks.new_tensor(features=torch.column_stack((landmarks.F, 
+        #         torch.full((landmarks.C.shape[0],), i).to(coords.device),
+        #     )))
+        #     landmarks_list.append(landmarks)
+        # pred_landmarks = teethland.cat(landmarks_list)
+
+        # landmarks = batch[1][0].new_tensor(features=torch.clip(batch[1][0].F - 1, 0, 4))
+        # self.landmark_map.update(pred_landmarks, landmarks)
+        
+        # log_dict['landmark_map/val'] = self.landmark_map
+        # self.log_dict(log_dict, batch_size=x.batch_size, sync_dist=True)
 
     def configure_optimizers(self) -> Tuple[
         List[torch.optim.Optimizer],
         List[_LRScheduler],
     ]:
         opt = torch.optim.AdamW(
-            params=[
-                *self.backbone.param_groups(self.lr),
-                *self.map_mlp.param_groups(self.lr),
-            ],
+            params=self.model.param_groups(self.lr),
             weight_decay=self.weight_decay,
         )
 

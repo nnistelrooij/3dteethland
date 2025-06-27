@@ -23,6 +23,115 @@ class BCELoss(nn.Module):
         loss = self.criterion(x.F[:, 0], (y.F >= 0).float())
 
         return loss
+    
+
+class BinarySegmentationLoss(nn.Module):
+    "Implements binary segmentation loss function."
+
+    def __init__(
+        self,
+        bce_weight: float=1.0,
+        dice_weight: float=0.0,
+        focal_weight: float=0.0,
+        focal_alpha: float=0.25,
+        focal_gamma: float=2.0,
+    ) -> None:
+        super().__init__()
+
+        self.bce = nn.BCEWithLogitsLoss()
+
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.alpha = focal_alpha
+        self.gamma = focal_gamma
+
+    def forward(
+        self,
+        x: PointTensor,
+        y: PointTensor
+    ) -> TensorType[torch.float32]:
+        pred = x.F[:, 0]
+        target = (y.F >= 0).float()
+        
+        loss = self.bce_weight * self.bce(pred, target)
+
+        if self.dice_weight:        
+            probs = torch.sigmoid(pred)
+            dim = tuple(range(1, len(probs.shape)))
+            numerator = 2 * torch.sum(probs * target, dim=dim)
+            denominator = torch.sum(probs ** 2, dim=dim) + torch.sum(target ** 2, dim=dim)
+            dice_loss = 1 - torch.mean((numerator + 1) / (denominator + 1))
+
+            loss += self.dice_weight * dice_loss
+
+        if self.focal_weight:
+            bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+            pt = torch.exp(-bce_loss)
+            focal_loss = self.alpha * (1 - pt)**self.gamma * bce_loss
+
+            loss += self.focal_weight * focal_loss.mean()
+
+        return loss
+    
+
+class MultiSegmentationLoss(nn.Module):
+    "Implements multiclass segmentation loss function."
+
+    def __init__(
+        self,
+        ce_weight: float=1.0,
+        dice_weight: float=1.0,
+        focal_weight: float=0.0,
+        focal_alpha: float=0.25,
+        focal_gamma: float=2.0,
+    ):
+        super().__init__()
+
+        self.ce = nn.CrossEntropyLoss()
+
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.alpha = focal_alpha
+        self.gamma = focal_gamma
+
+    def __call__(
+        self,
+        x: PointTensor,
+        y: PointTensor
+    ) -> TensorType[torch.float32]:
+        loss = self.ce_weight * self.ce(x.F, y.F)
+
+        if self.dice_weight:
+            probs = torch.softmax(x.F, dim=1).T
+            probs = probs.reshape(probs.shape[0], -1, x.batch_counts[0])
+
+            target = F.one_hot(y.F, num_classes=x.F.shape[1]).T
+            target = target.reshape(target.shape[0], -1, x.batch_counts[0])
+
+            dim = tuple(range(2, len(probs.shape)))
+            numerator = 2 * torch.sum(probs * target, dim=dim)
+            denominator = torch.sum(probs ** 2, dim=dim) + torch.sum(target ** 2, dim=dim)
+            dice_loss = 1 - torch.mean((numerator + 1e-5) / (denominator + 1e-5))
+
+            loss += self.dice_weight * dice_loss
+
+        if self.focal_weight:
+            log_p = F.log_softmax(x.F, dim=-1)
+            ce = F.nll_loss(log_p, y.F, reduction='none')
+
+            # get true class column from each row
+            all_rows = torch.arange(x.F.shape[0])
+            log_pt = log_p[all_rows, y.F]
+
+            # compute focal loss
+            pt = log_pt.exp()
+            focal_loss = (1 - pt)**self.gamma * ce
+
+            loss += self.focal_weight * focal_loss.mean()
+
+        return loss
 
 
 def mean(l, ignore_nan=False, empty=0):

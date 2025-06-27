@@ -3,6 +3,30 @@ version: mixedseg_validate
 seed: 0
 
 model:
+  align:
+    channels_list: [48, 96, 192, 256]
+    depths: [3, 9, 3]
+    heads_list: [6, 12, 24]
+    window_sizes: [0.4, 0.8, 1.6]
+    point_embedding:
+      use: True
+      kpconv_point_influence: 0.04
+      kpconv_ball_radius: 0.1
+    stratified_union: False
+    downsample_ratio: 0.26
+    max_drop_path_prob: 0.3
+    stratified_downsample_ratio: 0.26
+    crpe_bins: 80
+    transformer_lr_ratio: 0.1
+    checkpoint_path: '/home/mkaailab/Documents/IOS/partials/checkpoints/china_align_all_0.ckpt'
+    checkpoint_path: 'checkpoints/3dteethseg_align_all.ckpt'
+    checkpoint_path: '/mnt/diag/IOS/partials/checkpoints/3dteethseg_align_all.ckpt'
+    lr: 0.001
+    weight_decay: 0.0001
+    epochs: 1000
+    warmup_epochs: 5
+    do_seg: True
+
   instseg:
     channels_list: [48, 96, 192, 256]
     depths: [3, 9, 3]
@@ -22,7 +46,7 @@ model:
     # checkpoint_path: '/home/mkaailab/Documents/logs/tooth_segmentation/mixedseg_checked/checkpoints/weights-epoch=132-v1.ckpt'
     lr: 0.0006
     weight_decay: 0.0001
-    epochs: 500
+    epochs: 200  # overfitting after 600
     warmup_epochs: 5
 
   mixedseg:
@@ -48,9 +72,10 @@ model:
 
   landmarks:
     channels_list: [48, 96, 192, 256]
+    out_channels: [1, 4, 4, 4, 4, 4]
     depths: [3, 9, 3]
     heads_list: [6, 12, 24]
-    window_sizes: [0.2, 0.4, 0.8]
+    window_sizes: [0.1, 0.2, 0.4]
     point_embedding:
       use: True
       kpconv_point_influence: 0.02
@@ -67,41 +92,92 @@ model:
     weight_decay: 0.0001
     epochs: 500
     warmup_epochs: 5
+  
+  binseg:
+    channels_list: [48, 96, 192, 256]
+    depths: [3, 9, 3]
+    heads_list: [6, 12, 24]
+    window_sizes: [0.1, 0.2, 0.4]
+    point_embedding:
+      use: True
+      kpconv_point_influence: 0.015
+      kpconv_ball_radius: 0.03
+    stratified_union: False
+    downsample_ratio: 0.26
+    max_drop_path_prob: 0.3
+    stratified_downsample_ratio: 0.26
+    crpe_bins: 80
+    transformer_lr_ratio: 0.1
+    checkpoint_path: '/home/mkaailab/Documents/IOS/partials/checkpoints/china_binseg_partialnoalign_4.ckpt'
+    checkpoint_path: '/mnt/diag/IOS/Maud Wijbrandts/checkpoints/maud_lu_c_fractures_0/checkpoints/weights-epoch=79.ckpt'
+    checkpoint_path: '/mnt/diag/IOS/partials/checkpoints/3dteethseg_binseg_all.ckpt'
+    checkpoint_path: '/home/mkaailab/Documents/logs/tooth_segmentation/zainab2_foldall_dicefocal_pretrain/checkpoints/weights-epoch=199.ckpt'
+    lr: 0.0006
+    weight_decay: 0.0001
+    epochs: 200
+    warmup_epochs: 5
 
-  proposal_points: 10000
+  binseg_attributes:
+    channels_list: [48, 96, 192, 256]
+    depths: [3, 9, 3]
+    heads_list: [6, 12, 24]
+    window_sizes: [0.1, 0.2, 0.4]
+    point_embedding:
+      use: True
+      kpconv_point_influence: 0.015
+      kpconv_ball_radius: 0.03
+    stratified_union: False
+    downsample_ratio: 0.26
+    max_drop_path_prob: 0.3
+    stratified_downsample_ratio: 0.26
+    crpe_bins: 80
+    transformer_lr_ratio: 0.1
+    checkpoint_path: '/home/mkaailab/Documents/logs/tooth_segmentation/katja_fold3/checkpoints/weights-epoch=199.ckpt'
+    lr: 0.0006
+    weight_decay: 0.0001
+    epochs: 200
+    warmup_epochs: 5
+
+  proposal_points: 15000
   dbscan_cfg:
     max_neighbor_dist: 0.03
     min_points: 40  # [30, 50]
-    weighted: True
+    weighted_cluster: True
+    weighted_average: True
+  do_align: True
+  tta: True
+  stage2_iters: 2
+  post_process_seg: True
+  post_process_labels: True
 
 accumulate_grad_batches: 1  # 1 better segmentation, worse classification
 gradient_clip_norm: 35  # 10 is worse
 
-out_dir: ''
+out_dir: '/home/mkaailab/Documents/IOS/Zainab Bousshimad/data/clean'
 datamodule:
   root: '/work/grana_maxillo/BiteClassify/reduced_std_dataset'
   landmarks_root: '/work/grana_maxillo/BiteClassify/landmarks_full.ckpt'
   checkpoint_path: '/work/grana_maxillo/BiteClassify/instseg_full.ckpt'
   regex_filter: ''
   extensions: ['ply', 'stl', 'obj']
-  clean: True  # TODO: Set to true for Grand Challenge inference
+  # fold: 0
+  fold: 'zainab2_fold_4.txt'
+  norm: true
+  clean: true  # TODO: Set to true for Grand Challenge inference
   val_size: 0.2
-  include_val_as_train: false
+  include_val_as_train: False
+  sampler: 'balanced'  # 'default', 'balanced', or 'binary'
   batch: null  # [0, 100]
-  batch_size: 2
+  batch_size: 16
   num_workers: 1
   pin_memory: True
-  persistent_workers: False
-  # uniform_density_voxel_size: 0.025  # instseg
-  uniform_density_voxel_size: [0.025, 0.01]  # landmarks
-  boundary_aware:
-    use: False
-    voxel_size: 0.01
-    sample_ratio: 0.25
-  proposal_points: 10000
-  # proposal_points: 10000
-  max_proposals: 16
-  include_cusps: false
-  to_left_right: false
-  separate_front_posterior: false
-  distinguish_upper_lower: false  # True worse
+  persistent_workers: True
+  uniform_density_voxel_size: [0.025, 0.01]  # instseg, single-tooth
+  proposal_points: 12000
+  max_proposals: 8
+  m3_as_m2: False
+  distinguish_left_right: true
+  random_partial: False
+  distinguish_upper_lower: False  # True worse
+  label_as_instance: False
+  with_color: False

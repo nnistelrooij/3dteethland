@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Tuple
 import teethland
 import torch
 import torch.nn as nn
-from torch_scatter import scatter_mean
+from torch_scatter import scatter_max, scatter_mean
 from torchtyping import TensorType
 
 from teethland import PointTensor
@@ -65,10 +65,22 @@ class MaskedAveragePooling(nn.Module):
         self,
         features: PointTensor,
         instances: PointTensor,
-    ) -> Tuple[PointTensor, TensorType['B', 'C', torch.float32]]:
+    ) -> Tuple[PointTensor, PointTensor]:
+        assert torch.any(instances.F == -1)
+        
+        ids = instances.F.unique()
+        if ids.shape[0] == 1:
+            out = PointTensor(
+                coordinates=features.C[:0],
+                features=features.F[:0],
+                batch_counts=0 * features.batch_counts,
+            )
+
+            return out, out
+
         # apply instance masks to get prototypes
         prototypes, embeddings = [], []
-        for id in instances.F.unique()[1:]:
+        for id in ids[1:]:
             prototype = features[instances.F == id]
 
             prototypes.append(prototype)
@@ -84,9 +96,15 @@ class MaskedAveragePooling(nn.Module):
             instances.F[instances.F >= 0],
             dim=0
         )
+        
+        batch_counts = []
+        for idx in torch.unique(instances.batch_indices):
+            count = torch.unique(instances.F[instances.batch_indices == idx]).shape[0] - 1
+            batch_counts.append(count)
         out = PointTensor(
             coordinates=centroids,
             features=self.mlp(embeddings),
+            batch_counts=torch.tensor(batch_counts).to(instances.batch_indices),
         )
 
         return prototypes, out

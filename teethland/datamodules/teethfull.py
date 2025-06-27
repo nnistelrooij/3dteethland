@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import open3d
+from gco import cut_general_graph
 import torch
 from torchtyping import TensorType
 
@@ -27,10 +28,62 @@ class TeethInstFullDataModule(TeethInstSegDataModule):
             self.default_transforms,
         )
 
-    def process_instances(
+    def _min_graph_cut(
         self,
         instances: PointTensor,
-    ) -> PointTensor:
+        max_probs: TensorType['N', torch.float32],
+        round_factor: float=100.0,
+        lambda_c: float=20.0,
+        eps: float=1e-4,
+    ) -> TensorType['N', torch.bool]:
+        """Use minimum cut to derive foreground points."""
+        edge_idxs = torch.cat((
+            self.triangles[:, [0, 1]],
+            self.triangles[:, [0, 2]],
+            self.triangles[:, [1, 2]],
+        )).int()
+        edge_idxs = torch.unique(torch.sort(edge_idxs, dim=-1)[0], dim=0)
+
+        # unaries
+        max_probs = max_probs.clip(eps, 1 - eps)
+        probs = torch.column_stack((1 - max_probs, max_probs))
+        unaries = -round_factor * torch.log10(probs)
+        unaries = unaries.int()
+
+        # pairwise
+        pairwise = 1 - torch.eye(2).to(unaries)
+
+        # edge weights
+        cos_theta = torch.einsum('ni,ni->n', self.normals[edge_idxs[:, 0]], self.normals[edge_idxs[:, 1]])
+        cos_theta = cos_theta.clip(-1 + eps, 1 - eps)
+        theta = torch.arccos(cos_theta)
+        phi = torch.linalg.norm(instances.C[edge_idxs[:, 0]] - instances.C[edge_idxs[:, 1]], dim=-1)
+        beta = 1 + cos_theta
+        edge_weights = torch.where(
+            theta > np.pi / 2.0,
+            -torch.log10(theta / np.pi) * phi,
+            -beta * torch.log10(theta / np.pi) * phi
+        )
+        edge_weights = (edge_weights * lambda_c * round_factor).int()
+
+        # determine graph-cut and select label points
+        foreground = cut_general_graph(
+            edge_idxs.cpu().numpy(),
+            edge_weights.cpu().numpy(),
+            unaries.cpu().numpy(),
+            pairwise.cpu().numpy(),
+            down_weight_factor=1.0,
+        )
+        foreground = torch.from_numpy(foreground).to(instances.F)
+
+        return foreground == 1
+    
+    def _fill_background_triangles(
+        self,
+        instances: PointTensor,
+        max_probs: TensorType['N', torch.float32],
+        score_thresh: float=0.4,
+    ) -> TensorType['N', torch.int64]:
         # determine mesh of background triangles
         bg_mask = instances.F == -1
 
@@ -54,63 +107,75 @@ class TeethInstFullDataModule(TeethInstSegDataModule):
         cluster_idxs = torch.from_numpy(np.asarray(cluster_idxs)).to(instances.F)
         
         # add connected triangles surrounded by one instance to that instance
+        out = instances.F.clone()
         vertex_idxs = torch.nonzero(vertex_mask)[:, 0]
         for idx in torch.unique(cluster_idxs):
-            edges = torch.concatenate((
+            edge_idxs = torch.concatenate((
                 bg_triangles[cluster_idxs == idx][:, [0, 1]],
                 bg_triangles[cluster_idxs == idx][:, [0, 2]],
                 bg_triangles[cluster_idxs == idx][:, [1, 2]],
             ))
-            unique, counts = torch.unique(torch.sort(edges, dim=-1)[0], dim=0, return_counts=True)
+            unique, counts = torch.unique(torch.sort(edge_idxs, dim=-1)[0], dim=0, return_counts=True)
+            
             border_vertex_idxs = unique[counts == 1].flatten()
+            border_vertex_idxs = torch.unique(vertex_idxs[border_vertex_idxs])            
+            labels = instances.F[border_vertex_idxs]
 
-            labels = instances.F[vertex_idxs[border_vertex_idxs]]
-            if labels.shape[0] == 0 or labels[0] == -1 or not torch.all(labels[0] == labels):
+            middle_vertex_idxs = unique[counts == 2].flatten()
+            middle_vertex_idxs = torch.unique(vertex_idxs[middle_vertex_idxs])            
+            probs = max_probs[middle_vertex_idxs]
+
+            if (
+                labels.shape[0] == 0
+                or torch.any(labels == -1)
+                or not torch.all(labels[0] == labels)
+                or probs.mean() < score_thresh
+            ):
                 continue
 
-            instances.F[vertex_idxs[edges.flatten()]] = labels[0].item()
+            print('bg', (cluster_idxs == idx).sum(), probs.mean())
+            out[vertex_idxs[edge_idxs.flatten()]] = labels[0].item()
 
-        # determine mesh of tooth triangles
-        fg_mask = instances.F >= 0
+        return out
+    
+    def _remove_small_instances(
+        self,
+        instances: PointTensor,
+    ) -> TensorType['N', torch.int64]:
+        out = instances.F.clone()
 
-        fg_triangles = self.triangles[torch.any(fg_mask[self.triangles], dim=-1)]
-        
-        vertex_mask = torch.zeros_like(fg_mask)
-        vertex_mask[fg_triangles.flatten()] = True
-        fg_vertices = instances.C[vertex_mask]
-        
-        vertex_map = torch.full((instances.C.shape[0],), -1).to(instances.F)
-        vertex_map[vertex_mask] = torch.arange(fg_vertices.shape[0]).to(instances.F)
-        fg_triangles = vertex_map[fg_triangles]
+        # remove small instances
+        _, counts = torch.unique(instances.F, return_counts=True)
+        out[(counts < 30)[instances.F + 1]] = -1
 
-        fg_mesh = open3d.geometry.TriangleMesh(
-            open3d.utility.Vector3dVector(fg_vertices.cpu().numpy()),
-            open3d.utility.Vector3iVector(fg_triangles.cpu().numpy()),
-        )
+        if torch.amin(counts) < 30:
+            print('end', counts.amin())
 
-        # cluster connected triangles of teeth
-        cluster_idxs, _, cluster_areas = fg_mesh.cluster_connected_triangles()
-        cluster_idxs = torch.from_numpy(np.asarray(cluster_idxs)).to(instances.F)
-        cluster_areas = torch.from_numpy(np.asarray(cluster_areas)).to(instances.C)
+        return out
 
-        # remove small connected components
-        vertex_idxs = torch.nonzero(vertex_mask)[:, 0]
-        for idx in torch.unique(cluster_idxs):
-            if cluster_areas[idx] >= 0.005:
-                continue
+    def process_instances(
+        self,
+        instances: PointTensor,
+        max_probs: TensorType['N', torch.float32],
+    ) -> PointTensor:
+        # determine and label foreground points
+        foreground = self._min_graph_cut(instances, max_probs)
+        instances.F = torch.where(foreground, instances.F, -1)
 
-            cluster_vertex_idxs = fg_triangles[cluster_idxs == idx].flatten()
-            instances.F[vertex_idxs[cluster_vertex_idxs]] = -1
+        # fill surrounded background patches and remove small foreground patches
+        instances.F = self._fill_background_triangles(instances, max_probs)
+        instances.F = self._remove_small_instances(instances)
                 
         return instances
 
     def process_landmarks(
         self,
         labels: PointTensor,
+        affine: TensorType[4, 4, torch.float32],
         landmarks: PointTensor,
     ) -> PointTensor:
         # apply inverse affine transformation to undo preprocessing
-        affine = labels.cache['rot_matrix'] @ self.affine[0]
+        affine = affine @ self.affine[0]
         landmarks_hom = torch.column_stack((
             landmarks.C, torch.ones_like(landmarks.C[:, 0]),
         ))
@@ -180,12 +245,13 @@ class TeethInstFullDataModule(TeethInstSegDataModule):
     def setup(self, stage: Optional[str]=None):
         if stage is None or stage == 'predict':
             files = self._files('predict', exclude=[])
+            _, files = self._split(files)
             print('Total number of files:', len(files))
-
             self.pred_dataset = TeethSegDataset(
                 stage='predict',
                 root=self.root,
                 files=files,
+                norm=self.norm,
                 clean=self.clean,
                 transform=self.default_transforms,
             )
@@ -205,6 +271,7 @@ class TeethInstFullDataModule(TeethInstSegDataModule):
         scan_file = batch_dict['scan_file'][0]
         is_lower = torch.stack(batch_dict['is_lower'])
         triangles = torch.cat(batch_dict['triangles'])
+        normals = torch.cat(batch_dict['normals'])
         affine = torch.stack(batch_dict['affine'])
 
         # collate input points and features
@@ -226,7 +293,7 @@ class TeethInstFullDataModule(TeethInstSegDataModule):
             batch_dict['ud_downsample_count_2'],
         )
 
-        return scan_file, is_lower, triangles, affine, x
+        return scan_file, is_lower, triangles, normals, affine, x
 
     def transfer_batch_to_device(
         self,
@@ -237,9 +304,10 @@ class TeethInstFullDataModule(TeethInstSegDataModule):
         self.scan_file = batch[0]
         self.is_lower = batch[1].to(device)
         self.triangles = batch[2].to(device)
-        self.affine = batch[3].to(device)
+        self.normals = batch[3].to(device)
+        self.affine = batch[4].to(device)
 
-        return batch[4].to(device)
+        return batch[5].to(device)
     
 
 class TeethMixedFullDataModule(TeethInstFullDataModule):
@@ -248,51 +316,10 @@ class TeethMixedFullDataModule(TeethInstFullDataModule):
     def num_classes(self) -> int:
         return 12 if self.filter or not self.distinguish_upper_lower else 24
 
-    def reorder_teeth(
-        self,
-        classes: PointTensor,
-        side_mask: TensorType['N', torch.bool],
-        dist_thresh_nonmolar: float=0.35,
-        dist_thresh_molar: float=0.5,
-    ) -> PointTensor:
-        # fix teeth labels iteratively on one side
-        side_idxs = torch.nonzero(side_mask)[:, 0]
-        side_classes = classes[side_idxs]
-        sort_cols = torch.column_stack((side_classes.F, side_classes.C[:, 1]))
-        _, argsort1 = torch.sort(sort_cols[:, 1], stable=True)
-        _, argsort0 = torch.sort(sort_cols[argsort1, 0], stable=True)
-        argsort = argsort1[argsort0]
-        batch_idxs = side_classes.batch_indices[argsort]
-        coords = side_classes.C[argsort]
-        for i in range(side_idxs.shape[0] - 1):
-            if batch_idxs[i] != batch_idxs[i + 1]:
-                continue
-
-            i_ = side_idxs[argsort[i]]
-            j_ = side_idxs[argsort[i + 1]]
-            if classes.F[i_] < 2:
-                continue
-            
-            dist_thresh = dist_thresh_nonmolar if classes.F[j_] < 5 else dist_thresh_molar
-            dist = torch.sqrt(torch.sum((coords[i, :2] - coords[i + 1, :2])**2))
-            dist_offset = classes.F[j_] - classes.F[i_]
-            if dist / dist_thresh < 1 + dist_offset:
-                continue
-            
-            classes.F[j_] = classes.F[i_] + (dist / dist_thresh).long()
-
-        # add third molar if three molars are present on one side
-        if (classes.F[side_idxs] >= 5).sum() == 3:
-            m3_idx = classes.C[classes.F >= 5, 1].argmax()
-            classes.F[torch.nonzero(classes.F >= 5)[m3_idx, 0]] = 7        
-
-        return classes
-
     def teeth_classes_to_labels(
         self,
         classes: PointTensor,
     ) -> PointTensor:
-
         # determine tooth instances on the right side of the arch
         right_mask = torch.zeros(0, dtype=torch.bool, device=classes.C.device)
         for batch_idx in range(classes.batch_size):
@@ -301,11 +328,11 @@ class TeethMixedFullDataModule(TeethInstFullDataModule):
             dim=1)
             is_incisor = torch.nonzero(is_incisor)[:, 0]
             is_incisor = is_incisor[torch.argsort(classes.C[is_incisor, 1])[:4]]
+            weights = 1 - (classes.F[is_incisor] % 7) / 2
 
-            if is_incisor.shape[0] <= 2:
+            if torch.sum(weights) < 2:
                 zero_x = 0.0
             else:
-                weights = 1 - (classes.F[is_incisor] % 7) / 2
                 zero_x = torch.sum(weights * classes.C[is_incisor, 0]) / torch.sum(weights)
 
             right = classes.batch(batch_idx).C[:, 0] < zero_x
@@ -313,16 +340,13 @@ class TeethMixedFullDataModule(TeethInstFullDataModule):
 
         # make room for third molars
         labels = classes.clone()
-        labels.F[labels.F >= 7] += 1
-
-        # do reordering without primary/permanent distinction
-        primary_mask = labels.F >= 8
-        labels.F = labels.F % 8
+        primary_mask = labels.F >= 7
+        labels.F = labels.F % 7
 
         # fix duplicate classes on one side, introducing third molars
-        labels = self.reorder_teeth(labels, right_mask)
-        labels = self.reorder_teeth(labels, ~right_mask)
-
+        labels = self.identify_m3(labels, right_mask)
+        labels = self.identify_m3(labels, ~right_mask)
+        
         # translate index label to FDI label
         if self.filter == 'lower':
             labels.F += 31 + 10 * right_mask + 40 * primary_mask
@@ -330,9 +354,8 @@ class TeethMixedFullDataModule(TeethInstFullDataModule):
             if self.distinguish_upper_lower:
                 raise NotImplementedError()
             else:
-                labels.F = torch.clip(labels.F, 0, 7)
                 labels.F += 40 * primary_mask * (labels.F < 5)
-                labels.F += 20 * self.is_lower[classes.batch_indices]
+                labels.F += 20 * self.is_lower[0]
                 
             labels.F += 11 + 10 * right_mask
         

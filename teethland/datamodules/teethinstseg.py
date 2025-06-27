@@ -1,10 +1,13 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+import json
+from time import perf_counter
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 from numpy.typing import NDArray
 from pytorch_lightning.trainer.states import RunningStage
 import torch
+from torch.distributions.multivariate_normal import MultivariateNormal
 from torchtyping import TensorType
 
 from teethland import PointTensor
@@ -21,8 +24,11 @@ class TeethInstSegDataModule(TeethSegDataModule):
         self,
         batch: Optional[Tuple[int, int]],
         uniform_density_voxel_size: int,
+        distinguish_left_right: bool,
         distinguish_upper_lower: bool,
-        boundary_aware: Dict[str, Union[bool, float]],
+        m3_as_m2: bool,
+        random_partial: bool,
+        with_color: bool,
         **dm_cfg,
     ):
         super().__init__(**dm_cfg)
@@ -31,24 +37,20 @@ class TeethInstSegDataModule(TeethSegDataModule):
             T.UniformDensityDownsample(uniform_density_voxel_size[0]),
             T.XYZAsFeatures(),
             T.NormalAsFeatures(),
+            (T.ColorAsFeatures() if with_color else dict),
             T.ToTensor(),
         )
         
         self.batch = None if batch is None else slice(*batch)
-        self.use_boundary_aware = boundary_aware.pop('use')
-        self.boundary_aware_cfg = boundary_aware
+        self.distinguish_left_right = distinguish_left_right
         self.distinguish_upper_lower = distinguish_upper_lower
+        self.m3_as_m2 = m3_as_m2
+        self.rand_partial = random_partial
         self.is_lower = None
+        self.with_color = with_color
 
     def setup(self, stage: Optional[str]=None):
         rng = np.random.default_rng(self.seed)
-        self.default_transforms = T.Compose(
-            (
-                T.BoundaryAwareDownsample(**self.boundary_aware_cfg, rng=rng)
-                if self.use_boundary_aware else dict
-            ),
-            self.default_transforms,
-        )
 
         if stage is None or stage == 'fit':
             files = self._files('fit')
@@ -56,7 +58,13 @@ class TeethInstSegDataModule(TeethSegDataModule):
             train_files, val_files = self._split(files)
 
             train_transforms = T.Compose(
-                T.RandomAxisFlip(rng=rng),
+                T.Compose(
+                    T.RandomPartial(rng, do_translate=False),
+                    T.ZScoreNormalize(None, 1),
+                    T.PoseNormalize(),
+                    T.InstanceCentroids(),
+                ) if self.rand_partial else dict,
+                T.RandomXAxisFlip(rng=rng),
                 T.RandomScale(rng=rng),
                 T.RandomZAxisRotate(rng=rng),
                 self.default_transforms,
@@ -66,6 +74,7 @@ class TeethInstSegDataModule(TeethSegDataModule):
                 stage='fit',
                 root=self.root,
                 files=train_files,
+                norm=self.norm,
                 clean=self.clean,
                 transform=train_transforms,
             )
@@ -73,6 +82,7 @@ class TeethInstSegDataModule(TeethSegDataModule):
                 stage='fit',
                 root=self.root,
                 files=val_files,
+                norm=self.norm,
                 clean=self.clean,
                 transform=self.default_transforms,
             )
@@ -83,17 +93,21 @@ class TeethInstSegDataModule(TeethSegDataModule):
                 stage='predict',
                 root=self.root,
                 files=files if self.batch is None else files[self.batch],
+                norm=self.norm,
                 clean=self.clean,
                 transform=self.default_transforms,
             )
 
     @property
     def num_channels(self) -> int:
-        return 6
+        return 6 + 3 * self.with_color
 
     @property
     def num_classes(self) -> int:
-        return 7 if self.filter or not self.distinguish_upper_lower else 14
+        factor = 1 if self.filter in ['lower', 'upper'] or not self.distinguish_upper_lower else 2
+        factor *= 2 if self.distinguish_left_right else 1
+        number = 7 if self.m3_as_m2 else 8
+        return factor * number
 
     def teeth_labels_to_classes(
         self,
@@ -114,21 +128,19 @@ class TeethInstSegDataModule(TeethSegDataModule):
                 f'Expected np.ndarray or torch.Tensor, got {type(labels)}.',
             )
 
-        classes[(11 <= labels) & (labels <= 17)] -= 11
-        classes[labels == 18] = 6
-        classes[(21 <= labels) & (labels <= 27)] -= 21
-        classes[labels == 28] = 6
+        classes[(11 <= labels) & (labels <= 18)] -= 11
+        classes[(21 <= labels) & (labels <= 28)] -= 13 if self.distinguish_left_right else 21
+        if self.m3_as_m2:
+            classes[labels == 18] = 6
+            classes[(21 <= labels) & (labels <= 28)] -= 1 if self.distinguish_left_right else 0
+            classes[labels == 28] = 13 if self.distinguish_left_right else 6
 
-        if self.filter == 'lower' or not self.distinguish_upper_lower:
-            classes[(31 <= labels) & (labels <= 37)] -= 31
+        classes[(31 <= labels) & (labels <= 38)] -= 31
+        classes[(41 <= labels) & (labels <= 48)] -= 33 if self.distinguish_left_right else 41
+        if self.m3_as_m2:
             classes[labels == 38] = 6
-            classes[(41 <= labels) & (labels <= 47)] -= 41
-            classes[labels == 48] = 6
-        else:
-            classes[(31 <= labels) & (labels <= 37)] -= 24
-            classes[labels == 38] = 13
-            classes[(41 <= labels) & (labels <= 47)] -= 34
-            classes[labels == 48] = 13
+            classes[(41 <= labels) & (labels <= 48)] -= 1 if self.distinguish_left_right else 0
+            classes[labels == 48] = 13 if self.distinguish_left_right else 6
         
         return classes
     
@@ -165,89 +177,98 @@ class TeethInstSegDataModule(TeethSegDataModule):
 
 
         return R
+    
+    def determine_seqence(self, classes):
+        directions = classes.C / torch.linalg.norm(classes.C, dim=-1, keepdim=True)
+        cos_angles = torch.einsum('ni,mi->nm', directions, directions)
 
-    def reorder_teeth(
+        idxs = torch.full((classes.C.shape[0],), -1).to(classes.C.device)
+        inverse = torch.full_like(idxs, -1)
+        idxs[0] = classes.C[:, 1].argmax()  # most posterior
+        inverse[idxs[0]] = 0
+        for i in range(1, idxs.shape[0]):
+            dots = cos_angles[idxs[i - 1], inverse == -1]
+            next_idx = torch.nonzero(inverse == -1)[dots.argmax(), 0]
+            idxs[i] = next_idx
+            inverse[next_idx] = i
+
+        return idxs, inverse
+    
+    def determine_transition_probabilities(
         self,
-        classes: PointTensor,
-        side_mask: TensorType['N', torch.bool],
-        dist_thresh_nonmolar: float=0.35,
-        dist_thresh_molar: float=0.5,
-    ) -> PointTensor:
-        # fix teeth labels iteratively on one side
-        side_idxs = torch.nonzero(side_mask)[:, 0]
-        side_classes = classes[side_idxs]
-        sort_cols = torch.column_stack((side_classes.F, side_classes.C[:, 1]))
-        _, argsort1 = torch.sort(sort_cols[:, 1], stable=True)
-        _, argsort0 = torch.sort(sort_cols[argsort1, 0], stable=True)
-        argsort = argsort1[argsort0]
-        batch_idxs = side_classes.batch_indices[argsort]
-        coords = side_classes.C[argsort]
-        for i in range(side_idxs.shape[0] - 1):
-            if batch_idxs[i] != batch_idxs[i + 1]:
-                continue
+        classes,
+        idxs,
+    ):
+        with open('fdi_pair_distrs.json', 'r') as f:
+            pair_normals = json.load(f)
+        means = torch.tensor(pair_normals['means']).to(classes.F.device)
+        covs = torch.tensor(pair_normals['covs']).to(classes.F.device)
 
-            i_ = side_idxs[argsort[i]]
-            j_ = side_idxs[argsort[i + 1]]
-            if classes.F[i_] < 2:
-                continue
-            
-            dist_thresh = dist_thresh_nonmolar if classes.F[j_] < 5 else dist_thresh_molar
-            dist = torch.sqrt(torch.sum((coords[i, :2] - coords[i + 1, :2])**2))
-            dist_offset = classes.F[j_] - classes.F[i_]
-            if dist / dist_thresh < 1 + dist_offset:
-                continue
-            
-            classes.F[j_] = classes.F[i_] + (dist / dist_thresh).long()
+        offset = 16 * self.is_lower[0]
+        normals = MultivariateNormal(
+            loc=means[offset:offset + 16, offset:offset + 16, :2],
+            covariance_matrix=covs[offset:offset + 16, offset:offset + 16, :2, :2],
+        )
 
-        # add third molar if three molars are present on one side
-        if (classes.F[side_idxs] >= 5).sum() == 3:
-            m3_idx = classes.C[classes.F >= 5, 1].argmax()
-            classes.F[torch.nonzero(classes.F >= 5)[m3_idx, 0]] = 7        
+        trans_log_probs = torch.zeros(idxs.shape[0] - 1, 16, 16).to(classes.F)
+        for i, (idx1, idx2) in enumerate(zip(idxs[:-1], idxs[1:])):
+            offsets = classes.C[idx2] - classes.C[idx1]
+            trans_log_probs[i] = normals.log_prob(offsets[:2])
 
-        return classes
+        return trans_log_probs
+    
+    def dynamic_programming(
+        self,
+        classes,
+        idxs,
+        trans_log_probs,
+        tooth_factor: float=4.0,
+    ):
+        log_probs = torch.log(classes.F.softmax(dim=-1))
 
+        q = torch.zeros_like(log_probs)
+        q[0] = -tooth_factor * log_probs[idxs[0]]
+
+        up = torch.arange(16).to(classes.F.device)
+        p = torch.zeros_like(q).long()
+        p[0] = up
+
+        for i in range(1, classes.F.shape[0]):
+            for j in range(16):
+                prev_costs = q[i - 1]
+                trans_costs = -trans_log_probs[i - 1, :, j]
+                trans_costs[j] = 40
+
+                costs = prev_costs + trans_costs
+                m = costs.amin()
+                q[i, j] = m - tooth_factor * log_probs[idxs[i], j]
+                p[i, j] = costs.argmin()
+
+        path = q[-1].argmin(keepdim=True)
+        for i in range(p.shape[0] - 1):
+            path = torch.cat((p[None, -1 - i, path[0]], path))
+
+        return path, q[-1].min()
+    
     def teeth_classes_to_labels(
         self,
         classes: PointTensor,
-    ) -> PointTensor:
+        method: Literal['argmax', 'mincost']='mincost',
+    ):
+        labels = torch.zeros(0, dtype=torch.int64).to(classes.F.device)
+        for b in range(classes.batch_size):
+            if method == 'argmax':
+                numbers = torch.argmax(classes.batch(b).F, axis=-1)
+            elif method == 'mincost':
+                idxs, inverse = self.determine_seqence(classes.batch(b))
+                trans_log_probs = self.determine_transition_probabilities(classes.batch(b), idxs)
+                path, min_cost = self.dynamic_programming(classes.batch(b), idxs, trans_log_probs)
+                numbers = path[inverse]
 
-        # determine tooth instances on the right side of the arch
-        right_mask = torch.zeros(0, dtype=torch.bool, device=classes.C.device)
-        for batch_idx in range(classes.batch_size):
-            is_incisor = (classes.batch_indices == batch_idx) & (classes.F <= 1)
-            is_incisor = torch.nonzero(is_incisor)[:, 0]
-            is_incisor = is_incisor[torch.argsort(classes.C[is_incisor, 1])[:4]]
-
-            if is_incisor.shape[0] <= 2:
-                zero_x = 0.0
-            else:
-                weights = 1 - classes.F[is_incisor] / 2
-                zero_x = torch.sum(weights * classes.C[is_incisor, 0]) / torch.sum(weights)
-
-            right = classes.batch(batch_idx).C[:, 0] < zero_x
-            right_mask = torch.cat((right_mask, right))
-
-        # make room for third molars
-        labels = classes.clone()
-        labels.F[labels.F >= 7] += 1
-
-        # fix duplicate classes on one side, introducing third molars
-        labels = self.reorder_teeth(labels, right_mask)
-        labels = self.reorder_teeth(labels, ~right_mask)
-
-        # translate index label to FDI label
-        if self.filter == 'lower':
-            labels.F += 31 + 10 * right_mask
-        else:
-            if self.distinguish_upper_lower:
-                labels.F += 12 * (labels.F >= 8)
-            else:
-                labels.F = torch.clip(labels.F, 0, 7)
-                labels.F += 20 * self.is_lower[classes.batch_indices]
-                
-            labels.F += 11 + 10 * right_mask
-        
-        return labels
+            fdis = 11 + 20 * self.is_lower[0] + 10 * (numbers // 8) + (numbers % 8)
+            labels = torch.cat((labels, fdis))
+            
+        return classes.new_tensor(features=labels)
 
     def collate_downsample(
         self,
@@ -300,11 +321,7 @@ class TeethInstSegDataModule(TeethSegDataModule):
             batch_dict['ud_downsample_idxs'],
             batch_dict['ud_downsample_count'],
         )
-        x.cache['ts_downsample_idxs'] = self.collate_downsample(
-            batch_dict['point_count'],
-            batch_dict['ba_downsample_idxs'],
-            batch_dict['ba_downsample_count'],
-        ) if self.use_boundary_aware else x.cache['cp_downsample_idxs']
+        x.cache['ts_downsample_idxs'] = x.cache['cp_downsample_idxs']
 
         # collate output points
         points = PointTensor(

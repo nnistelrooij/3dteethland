@@ -1,0 +1,47 @@
+2024512_full_lower.ply
+2024512_full_upper.ply
+2024220_full_lower.ply
+2024220_full_upper.ply
+2024215_full_lower.ply
+2024215_full_upper.ply
+202414_full_upper.ply
+2023928_full_lower.ply
+202373_full_lower.ply
+202373_full_upper.ply
+2023715_full_lower.ply
+2023715_full_upper.ply
+202356_full_lower.ply
+202356_full_upper.ply
+2023316_full_lower.ply
+2023316_full_upper.ply
+2023311_full_upper.ply
+202326_full_lower.ply
+202326_full_upper.ply
+2023220_full_lower.ply
+2023220_full_upper.ply
+2023117_full_lower.ply
+2023117_full_upper.ply
+202293_full_lower.ply
+202293_full_upper.ply
+202279_full_lower.ply
+202279_full_upper.ply
+202278_full_upper.ply
+2022726_full_lower.ply
+2022726_full_upper.ply
+2022717_full_lower.ply
+2022717_full_upper.ply
+2022618_full_lower.ply
+2022618_full_upper.ply
+2022616_full_upper.ply
+2022371 - with attachments_full_lower.ply
+2022371 - with attachments_full_upper.ply
+2022218_full_lower.ply
+2022218_full_upper.ply
+20222181_full_lower.ply
+20222181_full_upper.ply
+20221114_full_lower.ply
+20221114_full_upper.ply
+20221029 - with attachments_full_lower.ply
+20221029 - with attachments_full_upper.ply
+20211040_full_lower.ply
+20211040_full_upper.ply

@@ -96,9 +96,6 @@ class DentalNet(pl.LightningModule):
         instance_loss = self.instance_criterion(offsets, sigmas, seeds, labels)
         identify_loss = self.identify_criterion(prototypes, classes, instances)
 
-        if torch.isnan(identify_loss):
-            print('NaN loss:', self.trainer.datamodule.scan_file)
-
         loss = instance_loss + identify_loss
         self.log_dict({
             'loss/train_instance': instance_loss,
